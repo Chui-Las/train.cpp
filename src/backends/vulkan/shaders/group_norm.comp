@@ -1,0 +1,105 @@
+#version 450
+// train.cpp - Vulkan 分组归一化 kernel（group_norm，通道维 ne2，与 ggml/CPU 一致）
+// 统计范围：(i0, i1, 组内 i2)，每个 (i3, 组) 一个 workgroup
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  ne3;
+    uint  n_groups;
+    uint  per_group;
+    uint  nb_a[4];
+    uint  nb_d[4];
+    uint  base_a;
+    uint  base_d;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float s_sum[256];
+shared float s_var[256];
+shared float s_stat[2];  // [mean, scale]
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint total_groups = pc.n_groups * pc.ne3;
+
+    for (uint st = gl_WorkGroupID.x; st < total_groups; st += gl_NumWorkGroups.x) {
+        const uint g  = st % pc.n_groups;
+        const uint i3 = st / pc.n_groups;
+        const uint c0 = g * pc.per_group;
+        const uint c1 = min(c0 + pc.per_group, pc.ne2);
+        if (c0 >= pc.ne2) {
+            continue;
+        }
+        const uint step = c1 - c0;
+        const uint count = step * pc.ne1 * pc.ne0;
+
+        // 第一遍：Σx
+        float acc = 0.0;
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            acc += data_a[pc.base_a + i0 * pc.nb_a[0] + i1 * pc.nb_a[1] + c * pc.nb_a[2] +
+                          i3 * pc.nb_a[3]];
+        }
+        s_sum[tid] = acc;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_sum[tid] += s_sum[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = s_sum[0] / float(count);
+        }
+        barrier();
+
+        // 第二遍：Σ(x-mean)²
+        const float mean = s_stat[0];
+        float var = 0.0;
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            const float d = data_a[pc.base_a + i0 * pc.nb_a[0] + i1 * pc.nb_a[1] + c * pc.nb_a[2] +
+                                   i3 * pc.nb_a[3]] - mean;
+            var += d * d;
+        }
+        s_var[tid] = var;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_var[tid] += s_var[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[1] = 1.0 / sqrt(s_var[0] / float(count) + pc.eps);
+        }
+        barrier();
+
+        // 第三遍：写出
+        const float scale = s_stat[1];
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            const uint oa = pc.base_a + i0 * pc.nb_a[0] + i1 * pc.nb_a[1] + c * pc.nb_a[2] +
+                            i3 * pc.nb_a[3];
+            const uint od = pc.base_d + i0 * pc.nb_d[0] + i1 * pc.nb_d[1] + c * pc.nb_d[2] +
+                            i3 * pc.nb_d[3];
+            data_d[od] = (data_a[oa] - mean) * scale;
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,78 @@
+#version 450
+// train.cpp - Vulkan 行内归一化 kernel（norm / rms_norm；一行一个 workgroup）
+// norm：mean=(Σx)/n，var=(Σ(x-mean)²)/n（两遍，与 CPU 一致），y=(x-mean)/sqrt(var+eps)
+// rms ：y=x/sqrt((Σx²)/n+eps)
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  mode;    // 0=norm, 1=rms_norm
+    uint  n_rows;
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  nb_a[4];
+    uint  nb_d[4];
+    uint  base_a;
+    uint  base_d;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float s_sum[256];
+shared float s_ss[256];
+shared float s_stat[2];  // [mean, scale]
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint row = gl_WorkGroupID.x; row < pc.n_rows; row += gl_NumWorkGroups.x) {
+        const uint i1 = row % pc.ne1;
+        const uint t  = row / pc.ne1;
+        const uint i2 = t % pc.ne2;
+        const uint i3 = t / pc.ne2;
+        const uint off_a = pc.base_a + i1 * pc.nb_a[1] + i2 * pc.nb_a[2] + i3 * pc.nb_a[3];
+        const uint off_d = pc.base_d + i1 * pc.nb_d[1] + i2 * pc.nb_d[2] + i3 * pc.nb_d[3];
+
+        float sum = 0.0;
+        float ss  = 0.0;
+        for (uint k = tid; k < pc.ne0; k += 256u) {
+            const float x = data_a[off_a + k * pc.nb_a[0]];
+            sum += x;
+            ss  += x * x;
+        }
+        s_sum[tid] = sum;
+        s_ss[tid]  = ss;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_sum[tid] += s_sum[tid + s];
+                s_ss[tid]  += s_ss[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            if (pc.mode == 1u) {
+                s_stat[0] = 0.0;
+                s_stat[1] = 1.0 / sqrt(s_ss[0] / float(pc.ne0) + pc.eps);
+            } else {
+                const float mean = s_sum[0] / float(pc.ne0);
+                float var = 0.0;
+                for (uint k = 0u; k < pc.ne0; ++k) {
+                    const float d = data_a[off_a + k * pc.nb_a[0]] - mean;
+                    var += d * d;
+                }
+                s_stat[0] = mean;
+                s_stat[1] = 1.0 / sqrt(var / float(pc.ne0) + pc.eps);
+            }
+        }
+        barrier();
+        const float mean  = s_stat[0];
+        const float scale = s_stat[1];
+        for (uint k = tid; k < pc.ne0; k += 256u) {
+            const float x = data_a[off_a + k * pc.nb_a[0]];
+            data_d[off_d + k * pc.nb_d[0]] = (pc.mode == 1u) ? x * scale : (x - mean) * scale;
+        }
+        barrier();
+    }
+}

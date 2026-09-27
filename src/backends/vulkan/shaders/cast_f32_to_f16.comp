@@ -1,0 +1,46 @@
+#version 450
+// train.cpp - Vulkan 类型转换 F32 -> F16（16 位存储；IEEE half，四舍五入为最近偶数）
+// 语义与 CPU/ggml 的 fp32_to_fp16 一致（packHalf2x16 为 RNE）
+// 需要设备特性 storageBuffer16BitAccess（由 C++ 端 supports_op 门控）
+// push constant 布局必须与 C++ 端 VulkanCastPC 一致（60 字节）
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne[4];
+    uint nb_s[4];  // 元素单位步长（按源类型）
+    uint nb_d[4];  // 元素单位步长（按目标类型）
+    uint base_s;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer S { float data_s[]; };
+layout(std430, binding = 1) writeonly buffer D { uint16_t data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne[d];
+            rem /= pc.ne[d];
+        }
+        uint off_s = pc.base_s;
+        uint off_d = pc.base_d;
+        for (int d = 0; d < 4; ++d) {
+            off_s += idx[d] * pc.nb_s[d];
+            off_d += idx[d] * pc.nb_d[d];
+        }
+        const float v = data_s[off_s];
+        data_d[off_d] = uint16_t(packHalf2x16(vec2(v, 0.0)) & 0xFFFFu);
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

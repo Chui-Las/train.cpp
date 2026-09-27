@@ -1,0 +1,75 @@
+#version 450
+// train.cpp - Vulkan pad reflect 反向 kernel（M2.3c，F32）
+// 语义：dX[j] = Σ_{i: reflect(i-lp)=j} dY[i]
+//   每维候选输出位置：中心 i=j+lp（恒有效）；左折叠 i=lp-j（1<=j<=lp）；
+//   右折叠 i=lp+2*ng-2-j（ng-1-rp<=j<=ng-2）；各路笛卡尔积（至多 3^4=81 项，无原子）
+// push constant 布局必须与 C++ 端 VulkanPadBackPC 一致（19×uint = 76 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne_x[4];  // 前向输入形状（本内核迭代域）
+    uint ne_g[4];  // 前向输出（grad）形状
+    uint lp[4];    // 每维左填充
+    uint nb_g[4];  // grad 元素单位步长
+    uint base_g;
+    uint base_x;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer G { float data_g[]; };
+layout(std430, binding = 1) writeonly buffer X { float data_x[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne_x[d];
+            rem /= pc.ne_x[d];
+        }
+
+        uint cand[4][3];
+        uint cnt[4];
+        for (int d = 0; d < 4; ++d) {
+            const uint j  = idx[d];
+            const uint lp = pc.lp[d];
+            const uint n  = pc.ne_x[d];  // 原输入长度（右折叠条件的基准）
+            const uint ng = pc.ne_g[d];
+            const uint rp = ng - lp - n;
+            cnt[d]        = 0;
+            // 中心（恒有效）
+            cand[d][cnt[d]++] = j + lp;
+            // 左折叠
+            if (j >= 1u && j <= lp) {
+                cand[d][cnt[d]++] = lp - j;
+            }
+            // 右折叠（rp>0 且 j 落在右侧反射区：n-1-rp <= j <= n-2）
+            if (rp > 0u && j + 1u >= n - rp && j + 1u < n) {
+                cand[d][cnt[d]++] = lp + 2u * n - 2u - j;
+            }
+        }
+
+        const uint total = cnt[0] * cnt[1] * cnt[2] * cnt[3];
+        float      acc   = 0.0;
+        for (uint m = 0; m < total; ++m) {
+            uint r   = m;
+            uint off = pc.base_g;
+            for (int d = 0; d < 4; ++d) {
+                const uint sel = r % cnt[d];
+                r /= cnt[d];
+                off += cand[d][sel] * pc.nb_g[d];
+            }
+            acc += data_g[off];
+        }
+        // pad_back 输出恒为新建连续张量：线性下标即元素偏移
+        data_x[pc.base_x + i] = acc;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

@@ -1,0 +1,84 @@
+#version 450
+// train.cpp - Vulkan im2col kernel（F32；语义与 ggml_im2col / CPU compute_im2col 一致）
+//   1D：kernel=[KW,IC]、img=[W,IC,N] -> dst=[IC*KW, OW, N, 1]（OH=1，dim2 存 N）
+//   2D：kernel=[KW,KH,IC]、img=[W,H,IC,N] -> dst=[IC*KH*KW, OW, OH, N]
+// 线程按输出元素并行；越界（padding 区域）补 0
+// push constant 布局必须与 C++ 端 VulkanIm2ColPC 一致（108 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint feat;  // IC*KH*KW
+    uint OW;
+    uint OH;
+    uint N;
+    uint IC;
+    uint IH;
+    uint IW;
+    uint KH;
+    uint KW;
+    int  s0;
+    int  s1;
+    int  p0;
+    int  p1;
+    int  d0;
+    int  d1;
+    uint is_2d;
+    uint nb_img[4];  // 元素单位步长
+    uint nb_d[4];
+    uint base_img;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer IMG { float data_img[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        // 输出元素下标：1D 布局 [feat, OW, N, 1]，2D 布局 [feat, OW, OH, N]
+        uint r = i;
+        const uint i0 = r % pc.feat;  r /= pc.feat;  // 特征（IC*KH*KW）
+        const uint i1 = r % pc.OW;    r /= pc.OW;    // OW
+        uint       i2 = 0;
+        uint       i3 = 0;
+        if (pc.is_2d != 0u) {
+            i2 = r % pc.OH;  r /= pc.OH;             // OH
+            i3 = r;                                  // N
+        } else {
+            i2 = r;                                  // N
+        }
+
+        // 分解特征维：i0 = iic*(KH*KW) + ikh*KW + ikw
+        const uint      khkw = pc.KH * pc.KW;
+        const uint      iic  = i0 / khkw;
+        const uint      rem  = i0 % khkw;
+        const uint      ikh  = rem / pc.KW;
+        const uint      ikw  = rem % pc.KW;
+
+        const int iiw = int(i1) * pc.s0 + int(ikw) * pc.d0 - pc.p0;
+        const int iih = (pc.is_2d != 0u) ? (int(i2) * pc.s1 + int(ikh) * pc.d1 - pc.p1) : 0;
+        const uint in_idx = (pc.is_2d != 0u) ? i3 : i2;
+
+        float        v  = 0.0;
+        const bool   ok = (iiw >= 0) && (iiw < int(pc.IW)) &&
+                        (pc.is_2d == 0u || ((iih >= 0) && (iih < int(pc.IH))));
+        if (ok) {
+            // 1D：IC 在 nb[1]、N 在 nb[2]；2D：IC 在 nb[2]、N 在 nb[3]（与 CPU 的 ofs_c/ofs_n 一致）
+            const uint off = pc.base_img + in_idx * pc.nb_img[(pc.is_2d != 0u) ? 3u : 2u] +
+                             iic * pc.nb_img[(pc.is_2d != 0u) ? 2u : 1u] + uint(iih) * pc.nb_img[1] +
+                             uint(iiw) * pc.nb_img[0];
+            v = data_img[off];
+        }
+
+        const uint off_d = pc.base_d + i0 * pc.nb_d[0] + i1 * pc.nb_d[1] + i2 * pc.nb_d[2] + i3 * pc.nb_d[3];
+        data_d[off_d] = v;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

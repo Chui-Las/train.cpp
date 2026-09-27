@@ -1,0 +1,27 @@
+# ---- 构建产物 ----
+/build/
+/build-*/
+/out/
+/install/
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# ---- IDE / 工具 ----
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# ---- 测试黄金数据（随仓库提供，可在无 PyTorch 环境下运行对拍测试） ----
+
+# ---- 模型/训练产物（大文件） ----
+*.gguf
+*.bin
+*.pth
+
+# ---- 临时/日志 ----
+*.log
+*.tmp

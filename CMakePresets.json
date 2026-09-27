@@ -1,0 +1,38 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Release (Ninja, Vulkan auto)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "release-cpu",
+      "inherits": "release",
+      "displayName": "Release (Ninja, CPU only)",
+      "binaryDir": "${sourceDir}/out/build/release-cpu",
+      "cacheVariables": {
+        "TRC_VULKAN": "OFF"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "release",
+      "displayName": "Debug (Ninja, Vulkan auto)",
+      "binaryDir": "${sourceDir}/out/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-cpu", "configurePreset": "release-cpu" },
+    { "name": "debug", "configurePreset": "debug" }
+  ]
+}

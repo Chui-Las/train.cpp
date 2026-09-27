@@ -1,0 +1,62 @@
+#version 450
+// train.cpp - Vulkan set_rows kernel（按索引把 values 行写入目标，与 ggml/CPU 一致）
+// values [ne0, nr, ni2, ni3]，索引 [nr, idx_ne1, idx_ne2]（I32），目标与结果共享内存
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne0;
+    uint nr;
+    uint ni2;
+    uint ni3;
+    uint idx_ne1;
+    uint idx_ne2;
+    uint n_vocab;   // 目标行数（越界保护）
+    uint nb_v[4];
+    uint nb_t[4];
+    uint nb_i[3];
+    uint base_v;
+    uint base_t;
+    uint base_i;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer V { float data_v[]; };
+layout(std430, binding = 1) readonly buffer I { int data_i[]; };
+layout(std430, binding = 2) buffer T { float data_t[]; };
+// 设备端错误标志：errors[2]=2（set_rows）
+layout(std430, binding = 3) buffer ERR { uint errors[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        const uint i0 = i % pc.ne0;
+        uint       t  = i / pc.ne0;
+        const uint r  = t % pc.nr;
+        t /= pc.nr;
+        const uint i2 = t % pc.ni2;
+        const uint i3 = t / pc.ni2;
+
+        const uint ci1 = i2 % pc.idx_ne1;
+        const uint ci2 = i3 % pc.idx_ne2;
+        const int  row = data_i[pc.base_i + r * pc.nb_i[0] + ci1 * pc.nb_i[1] + ci2 * pc.nb_i[2]];
+        if (row < 0 || uint(row) >= pc.n_vocab) {
+            // 索引越界：置错误标志（主机在 graph_compute 结束后中止，与 CPU abort 语义一致）
+            atomicOr(errors[0], 1u);
+            errors[1] = uint(row);
+            errors[2] = 2u;  // set_rows
+        } else {
+            const uint off_v = pc.base_v + i0 * pc.nb_v[0] + r * pc.nb_v[1] + i2 * pc.nb_v[2] +
+                               i3 * pc.nb_v[3];
+            const uint off_t = pc.base_t + i0 * pc.nb_t[0] + uint(row) * pc.nb_t[1] +
+                               i2 * pc.nb_t[2] + i3 * pc.nb_t[3];
+            data_t[off_t] = data_v[off_v];
+        }
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

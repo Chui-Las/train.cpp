@@ -1,0 +1,141 @@
+#version 450
+// train.cpp - Vulkan 行内归一化反向 kernel（norm_back / rms_norm_back；一行一个 workgroup）
+// 语义与 CPU compute_norm_back / compute_rms_norm_back / ggml rms_norm_back 一致：
+//   norm_back    : mean/var 两遍统计；dx = rstd*(dy - mean(dy) - xc*rstd²*mean(dy*xc))
+//   rms_norm_back: rrms=1/sqrt(Σx²/n+eps)；scale=-Σ(x·dz)/(Σx²+eps·n)；dx=(dz + x*scale)*rrms
+// push constant 布局必须与 C++ 端 VulkanNormBackPC 一致（84 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  mode;  // 0=norm_back, 1=rms_norm_back
+    uint  n_rows;
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  nb_dy[4];
+    uint  nb_x[4];
+    uint  nb_d[4];
+    uint  base_dy;
+    uint  base_x;
+    uint  base_d;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) readonly buffer DY { float data_dy[]; };
+layout(std430, binding = 1) readonly buffer X { float data_x[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+shared float s_a[256];
+shared float s_b[256];
+shared float s_c[256];
+shared float s_stat[3];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint row = gl_WorkGroupID.x; row < pc.n_rows; row += gl_NumWorkGroups.x) {
+        const uint i1 = row % pc.ne1;
+        const uint t  = row / pc.ne1;
+        const uint i2 = t % pc.ne2;
+        const uint i3 = t / pc.ne2;
+
+        const uint  off_dy = pc.base_dy + i1 * pc.nb_dy[1] + i2 * pc.nb_dy[2] + i3 * pc.nb_dy[3];
+        const uint  off_x  = pc.base_x + i1 * pc.nb_x[1] + i2 * pc.nb_x[2] + i3 * pc.nb_x[3];
+        const uint  off_d  = pc.base_d + i1 * pc.nb_d[1] + i2 * pc.nb_d[2] + i3 * pc.nb_d[3];
+        const float inv_n  = 1.0 / float(pc.ne0);
+
+        if (pc.mode == 1u) {
+            // rms_norm_back：一遍统计 Σx² 与 Σ(x·dz)
+            float a0 = 0.0;
+            float b0 = 0.0;
+            for (uint k = tid; k < pc.ne0; k += 256u) {
+                const float xv = data_x[off_x + k * pc.nb_x[0]];
+                a0 += xv * xv;
+                b0 += xv * data_dy[off_dy + k * pc.nb_dy[0]];
+            }
+            s_a[tid] = a0;
+            s_b[tid] = b0;
+            barrier();
+            for (uint s = 128u; s > 0u; s >>= 1) {
+                if (tid < s) {
+                    s_a[tid] += s_a[tid + s];
+                    s_b[tid] += s_b[tid + s];
+                }
+                barrier();
+            }
+            if (tid == 0u) {
+                s_stat[0] = 1.0 / sqrt(s_a[0] * inv_n + pc.eps);              // rrms
+                s_stat[1] = -s_b[0] / (s_a[0] + pc.eps * float(pc.ne0));      // scale_x
+            }
+            barrier();
+            const float rrms = s_stat[0];
+            const float sx   = s_stat[1];
+            for (uint k = tid; k < pc.ne0; k += 256u) {
+                const float xv = data_x[off_x + k * pc.nb_x[0]];
+                const float g  = data_dy[off_dy + k * pc.nb_dy[0]];
+                data_d[off_d + k * pc.nb_d[0]] = (g + xv * sx) * rrms;
+            }
+            barrier();
+        } else {
+            // norm_back 第一遍：Σx -> mean
+            float sum = 0.0;
+            for (uint k = tid; k < pc.ne0; k += 256u) {
+                sum += data_x[off_x + k * pc.nb_x[0]];
+            }
+            s_a[tid] = sum;
+            barrier();
+            for (uint s = 128u; s > 0u; s >>= 1) {
+                if (tid < s) {
+                    s_a[tid] += s_a[tid + s];
+                }
+                barrier();
+            }
+            if (tid == 0u) {
+                s_stat[0] = s_a[0] * inv_n;  // mean
+            }
+            barrier();
+
+            // 第二遍：var、Σdy、Σ(dy·xc)
+            const float mean = s_stat[0];
+            float var = 0.0;
+            float dy_sum = 0.0;
+            float dy_xc = 0.0;
+            for (uint k = tid; k < pc.ne0; k += 256u) {
+                const float xv = data_x[off_x + k * pc.nb_x[0]];
+                const float g  = data_dy[off_dy + k * pc.nb_dy[0]];
+                const float xc = xv - mean;
+                var += xc * xc;
+                dy_sum += g;
+                dy_xc += g * xc;
+            }
+            s_a[tid] = var;
+            s_b[tid] = dy_sum;
+            s_c[tid] = dy_xc;
+            barrier();
+            for (uint s = 128u; s > 0u; s >>= 1) {
+                if (tid < s) {
+                    s_a[tid] += s_a[tid + s];
+                    s_b[tid] += s_b[tid + s];
+                    s_c[tid] += s_c[tid + s];
+                }
+                barrier();
+            }
+            if (tid == 0u) {
+                s_stat[0] = 1.0 / sqrt(s_a[0] * inv_n + pc.eps);  // rstd
+                s_stat[1] = s_b[0] * inv_n;                       // mean(dy)
+                s_stat[2] = s_c[0] * inv_n;                       // mean(dy*xc)
+            }
+            barrier();
+
+            const float rstd = s_stat[0];
+            const float md   = s_stat[1];
+            const float mdxc = s_stat[2];
+            for (uint k = tid; k < pc.ne0; k += 256u) {
+                const float xv = data_x[off_x + k * pc.nb_x[0]];
+                const float g  = data_dy[off_dy + k * pc.nb_dy[0]];
+                data_d[off_d + k * pc.nb_d[0]] =
+                    rstd * (g - md - (xv - mean) * rstd * rstd * mdxc);
+            }
+            barrier();
+        }
+    }
+}

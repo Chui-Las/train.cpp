@@ -1,0 +1,9 @@
+kind conv1d_grouped
+has_bias 1
+in_channels 4
+out_channels 4
+kernel 3
+stride0 1
+padding0 0
+dilation0 1
+num_groups 2

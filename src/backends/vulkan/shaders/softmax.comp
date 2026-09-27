@@ -1,0 +1,109 @@
+#version 450
+// train.cpp - Vulkan softmax kernel（soft_max / soft_max_ext；沿 ne0，一行一个 workgroup）
+// 与 CPU/ggml 一致：v = x*scale (+ slope*mask)，数值稳定减 max，可选 ALiBi 斜率
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  ne3;
+    uint  nb_a[4];
+    uint  nb_d[4];
+    uint  nb_m[4];
+    uint  base_a;
+    uint  base_d;
+    uint  base_m;
+    uint  ne12;
+    uint  ne13;
+    uint  has_mask;
+    uint  use_alibi;
+    uint  n_head_log2;
+    float scale;
+    float m0;
+    float m1;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+layout(std430, binding = 2) readonly buffer M { float data_m[]; };
+
+shared float s_red[256];
+shared float s_stat[1];
+
+float row_value(uint k, uint off_a, uint off_m, float slope) {
+    float v = data_a[off_a + k * pc.nb_a[0]] * pc.scale;
+    if (pc.has_mask != 0u) {
+        v += slope * data_m[off_m + k * pc.nb_m[0]];
+    }
+    return v;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n_rows = pc.ne1 * pc.ne2 * pc.ne3;
+
+    for (uint row = gl_WorkGroupID.x; row < n_rows; row += gl_NumWorkGroups.x) {
+        const uint i1 = row % pc.ne1;
+        const uint t  = row / pc.ne1;
+        const uint i2 = t % pc.ne2;
+        const uint i3 = t / pc.ne2;
+
+        const uint off_a = pc.base_a + i1 * pc.nb_a[1] + i2 * pc.nb_a[2] + i3 * pc.nb_a[3];
+        const uint off_d = pc.base_d + i1 * pc.nb_d[1] + i2 * pc.nb_d[2] + i3 * pc.nb_d[3];
+        uint off_m = 0u;
+        if (pc.has_mask != 0u) {
+            const uint i12 = i2 % pc.ne12;
+            const uint i13 = i3 % pc.ne13;
+            off_m = pc.base_m + i1 * pc.nb_m[1] + i12 * pc.nb_m[2] + i13 * pc.nb_m[3];
+        }
+        float slope = 1.0;
+        if (pc.use_alibi != 0u) {
+            slope = (i2 < pc.n_head_log2) ? pow(pc.m0, float(i2 + 1u))
+                                          : pow(pc.m1, float(2u * (i2 - pc.n_head_log2) + 1u));
+        }
+
+        // 最大值
+        float mx = row_value(tid < pc.ne0 ? tid : 0u, off_a, off_m, slope);
+        for (uint k = tid; k < pc.ne0; k += 256u) {
+            mx = max(mx, row_value(k, off_a, off_m, slope));
+        }
+        s_red[tid] = mx;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_red[tid] = max(s_red[tid], s_red[tid + s]);
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = s_red[0];
+        }
+        barrier();
+        const float max_val = s_stat[0];
+
+        // Σexp
+        float sum = 0.0;
+        for (uint k = tid; k < pc.ne0; k += 256u) {
+            sum += exp(row_value(k, off_a, off_m, slope) - max_val);
+        }
+        s_red[tid] = sum;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_red[tid] += s_red[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = 1.0 / s_red[0];
+        }
+        barrier();
+        const float inv = s_stat[0];
+
+        for (uint k = tid; k < pc.ne0; k += 256u) {
+            data_d[off_d + k * pc.nb_d[0]] = exp(row_value(k, off_a, off_m, slope) - max_val) * inv;
+        }
+        barrier();
+    }
+}

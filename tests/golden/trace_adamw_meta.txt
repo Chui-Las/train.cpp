@@ -1,0 +1,16 @@
+kind adamw
+lr 0.02
+weight_decay 0.0
+momentum 0.0
+dampening 0.0
+beta1 0.9
+beta2 0.999
+eps 1e-08
+nesterov 0
+epochs 3
+steps 4
+in 4
+hid 8
+out 3
+batch 8
+nparams 4

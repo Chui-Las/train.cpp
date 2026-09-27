@@ -1,0 +1,88 @@
+#version 450
+// train.cpp - Vulkan 交叉熵反向 kernel（cross_entropy_loss_back；一行一个 workgroup）
+// 与 ggml/CPU 一致：dA = (softmax(logits) - target) * grad / nr（target 视为常量）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  nc;      // ne0（类别数）
+    uint  nr;      // ne1*ne2*ne3（行数）
+    uint  ne1;
+    uint  ne2;
+    uint  nb_a[4]; // logits 步长（元素单位）
+    uint  nb_b[4]; // target 步长（元素单位）
+    uint  nb_d[4]; // 输出步长（元素单位）
+    uint  base_a;
+    uint  base_b;
+    uint  base_g;  // grad 标量元素基址
+    uint  base_d;
+    float inv_nr;  // 1/nr
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) readonly buffer B { float data_b[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+layout(std430, binding = 3) readonly buffer G { float data_g[]; };
+
+shared float s_red[256];
+shared float s_stat[1];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const float grad = data_g[pc.base_g];
+
+    for (uint row = gl_WorkGroupID.x; row < pc.nr; row += gl_NumWorkGroups.x) {
+        const uint i1 = row % pc.ne1;
+        const uint t  = row / pc.ne1;
+        const uint i2 = t % pc.ne2;
+        const uint i3 = t / pc.ne2;
+
+        const uint off_a = pc.base_a + i1 * pc.nb_a[1] + i2 * pc.nb_a[2] + i3 * pc.nb_a[3];
+        const uint off_b = pc.base_b + i1 * pc.nb_b[1] + i2 * pc.nb_b[2] + i3 * pc.nb_b[3];
+        const uint off_d = pc.base_d + i1 * pc.nb_d[1] + i2 * pc.nb_d[2] + i3 * pc.nb_d[3];
+
+        // 最大值
+        float mx = -3.402823466e+38;
+        for (uint k = tid; k < pc.nc; k += 256u) {
+            mx = max(mx, data_a[off_a + k * pc.nb_a[0]]);
+        }
+        s_red[tid] = mx;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_red[tid] = max(s_red[tid], s_red[tid + s]);
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = s_red[0];
+        }
+        barrier();
+        const float max_val = s_stat[0];
+
+        // Σexp
+        float sum = 0.0;
+        for (uint k = tid; k < pc.nc; k += 256u) {
+            sum += exp(data_a[off_a + k * pc.nb_a[0]] - max_val);
+        }
+        s_red[tid] = sum;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_red[tid] += s_red[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = 1.0 / s_red[0];
+        }
+        barrier();
+        const float inv = s_stat[0];
+
+        const float d_by_nr = grad * pc.inv_nr;
+        for (uint k = tid; k < pc.nc; k += 256u) {
+            const float soft = exp(data_a[off_a + k * pc.nb_a[0]] - max_val) * inv;
+            data_d[off_d + k * pc.nb_d[0]] = (soft - data_b[off_b + k * pc.nb_b[0]]) * d_by_nr;
+        }
+        barrier();
+    }
+}

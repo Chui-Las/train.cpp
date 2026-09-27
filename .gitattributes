@@ -1,0 +1,13 @@
+# 统一以 LF 入库，避免 Windows 自动换行转换造成虚假 diff
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF（PS 5.1 / cmd 兼容）
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.npy binary
+*.gguf binary
+*.spv binary

@@ -1,0 +1,131 @@
+#version 450
+// train.cpp - Vulkan 分组归一化反向 kernel（group_norm_back；每个 (i3, 组) 一个 workgroup）
+// 统计范围与 group_norm 一致：(i0, i1, 组内 i2)；套用 LayerNorm 反向公式（与 CPU 一致）
+// push constant 布局必须与 C++ 端 VulkanGroupNormBackPC 一致（88 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  ne0;
+    uint  ne1;
+    uint  ne2;
+    uint  ne3;
+    uint  n_groups;
+    uint  per_group;
+    uint  nb_dy[4];
+    uint  nb_x[4];
+    uint  nb_d[4];
+    uint  base_dy;
+    uint  base_x;
+    uint  base_d;
+    float eps;
+} pc;
+
+layout(std430, binding = 0) readonly buffer DY { float data_dy[]; };
+layout(std430, binding = 1) readonly buffer X { float data_x[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+shared float s_a[256];
+shared float s_b[256];
+shared float s_c[256];
+shared float s_stat[3];
+
+void main() {
+    const uint tid          = gl_LocalInvocationID.x;
+    const uint total_groups = pc.n_groups * pc.ne3;
+
+    for (uint st = gl_WorkGroupID.x; st < total_groups; st += gl_NumWorkGroups.x) {
+        const uint g  = st % pc.n_groups;
+        const uint i3 = st / pc.n_groups;
+        const uint c0 = g * pc.per_group;
+        const uint c1 = min(c0 + pc.per_group, pc.ne2);
+        if (c0 >= pc.ne2) {
+            continue;
+        }
+        const uint step  = c1 - c0;
+        const uint count = step * pc.ne1 * pc.ne0;
+        const float inv_count = 1.0 / float(count);
+
+        // 第一遍：Σx -> mean
+        float acc = 0.0;
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            acc += data_x[pc.base_x + i0 * pc.nb_x[0] + i1 * pc.nb_x[1] + c * pc.nb_x[2] +
+                          i3 * pc.nb_x[3]];
+        }
+        s_a[tid] = acc;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_a[tid] += s_a[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = s_a[0] * inv_count;
+        }
+        barrier();
+
+        // 第二遍：var、Σdy、Σ(dy·xc)
+        const float mean = s_stat[0];
+        float var = 0.0;
+        float dy_sum = 0.0;
+        float dy_xc = 0.0;
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            const uint ox = pc.base_x + i0 * pc.nb_x[0] + i1 * pc.nb_x[1] + c * pc.nb_x[2] +
+                            i3 * pc.nb_x[3];
+            const uint og = pc.base_dy + i0 * pc.nb_dy[0] + i1 * pc.nb_dy[1] + c * pc.nb_dy[2] +
+                            i3 * pc.nb_dy[3];
+            const float xv = data_x[ox];
+            const float gv = data_dy[og];
+            const float xc = xv - mean;
+            var += xc * xc;
+            dy_sum += gv;
+            dy_xc += gv * xc;
+        }
+        s_a[tid] = var;
+        s_b[tid] = dy_sum;
+        s_c[tid] = dy_xc;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                s_a[tid] += s_a[tid + s];
+                s_b[tid] += s_b[tid + s];
+                s_c[tid] += s_c[tid + s];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_stat[0] = 1.0 / sqrt(s_a[0] * inv_count + pc.eps);  // rstd
+            s_stat[1] = s_b[0] * inv_count;                       // mean(dy)
+            s_stat[2] = s_c[0] * inv_count;                       // mean(dy*xc)
+        }
+        barrier();
+
+        // 第三遍：写出
+        const float rstd = s_stat[0];
+        const float md   = s_stat[1];
+        const float mdxc = s_stat[2];
+        for (uint e = tid; e < count; e += 256u) {
+            const uint i0 = e % pc.ne0;
+            const uint t  = e / pc.ne0;
+            const uint i1 = t % pc.ne1;
+            const uint c  = c0 + t / pc.ne1;
+            const uint ox = pc.base_x + i0 * pc.nb_x[0] + i1 * pc.nb_x[1] + c * pc.nb_x[2] +
+                            i3 * pc.nb_x[3];
+            const uint og = pc.base_dy + i0 * pc.nb_dy[0] + i1 * pc.nb_dy[1] + c * pc.nb_dy[2] +
+                            i3 * pc.nb_dy[3];
+            const uint od = pc.base_d + i0 * pc.nb_d[0] + i1 * pc.nb_d[1] + c * pc.nb_d[2] +
+                            i3 * pc.nb_d[3];
+            const float xc = data_x[ox] - mean;
+            data_d[od] = rstd * (data_dy[og] - md - xc * rstd * rstd * mdxc);
+        }
+        barrier();
+    }
+}

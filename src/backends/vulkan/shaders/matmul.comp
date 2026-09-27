@@ -1,0 +1,126 @@
+#version 450
+// train.cpp - Vulkan tiled F32 matmul kernel（mul_mat，batch）
+// 语义与 ggml_mul_mat 对齐：a=[k,m,a2,a3]、b=[k,n,b2,b3] -> d=[m,n,b2,b3]
+//   - a、b 均按 nb（元素单位步长）寻址，支持转置/任意视图（CPU 参考实现同样支持）
+//   - 平面 p（grid z）解码为 (i2,i3)，a 的平面取 (i2 % a2, i3 % a3)（batch 广播）
+//   - 分块 BM=BN=64、BK=16，shared 内存缓存；每线程算 4x4
+//   - grid：x = n 分块、y = m 分块、z = 平面；z 可被钳制，用 gl_NumWorkGroups.z 跨步
+// push constant 布局必须与 C++ 端 VulkanMatMulPC 一致（88 字节）
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint k;
+    uint m;
+    uint n;
+    uint n_planes;
+    uint b_ne2;
+    uint a_ne2;
+    uint a_ne3;
+    uint nb_a0;  // a 的内维（k）步长，元素单位
+    uint nb_a1;  // a 的行（m）步长
+    uint nb_a2;  // a 的平面步长
+    uint nb_a3;
+    uint nb_b0;  // b 的内维（k）步长
+    uint nb_b1;  // b 的行（n）步长
+    uint nb_b2;
+    uint nb_b3;
+    uint nb_d0;  // d 的行（m）步长
+    uint nb_d1;  // d 的列（n）步长
+    uint nb_d2;
+    uint nb_d3;
+    uint base_a;
+    uint base_b;
+    uint base_d;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) readonly buffer B { float data_b[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 16u;
+const uint TM = 4u;
+const uint TN = 4u;
+const uint NTHREADS = 256u;
+
+// 行末补 1 列/行，避免 shared bank 冲突
+shared float As[BM][BK + 1];
+shared float Bs[BK][BN + 1];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint tx  = gl_LocalInvocationID.x;
+    const uint ty  = gl_LocalInvocationID.y;
+    const uint m0  = gl_WorkGroupID.y * BM;
+    const uint n0  = gl_WorkGroupID.x * BN;
+    const uint tx4 = tx * TM;
+    const uint ty4 = ty * TN;
+
+    // 平面跨步循环（大 batch 时 grid z 被钳制，此处覆盖剩余平面）
+    for (uint plane = gl_WorkGroupID.z; plane < pc.n_planes; plane += gl_NumWorkGroups.z) {
+        const uint i2   = plane % pc.b_ne2;
+        const uint i3   = plane / pc.b_ne2;
+        const uint off_a = (i2 % pc.a_ne2) * pc.nb_a2 + (i3 % pc.a_ne3) * pc.nb_a3;
+        const uint off_b = i2 * pc.nb_b2 + i3 * pc.nb_b3;
+        const uint off_d = i2 * pc.nb_d2 + i3 * pc.nb_d3;
+
+        float acc[TM][TN];
+        for (uint i = 0; i < TM; ++i) {
+            for (uint j = 0; j < TN; ++j) {
+                acc[i][j] = 0.0;
+            }
+        }
+
+        for (uint k0 = 0; k0 < pc.k; k0 += BK) {
+            // 载入 A 块 [BM x BK]：越界补 0
+            for (uint t = tid; t < BM * BK; t += NTHREADS) {
+                const uint r  = t / BK;
+                const uint c  = t % BK;
+                const uint gm = m0 + r;
+                const uint gk = k0 + c;
+                float      v  = 0.0;
+                if (gm < pc.m && gk < pc.k) {
+                    v = data_a[pc.base_a + off_a + gm * pc.nb_a1 + gk * pc.nb_a0];
+                }
+                As[r][c] = v;
+            }
+            // 载入 B 块 [BK x BN]：越界补 0
+            for (uint t = tid; t < BK * BN; t += NTHREADS) {
+                const uint r  = t / BN;
+                const uint c  = t % BN;
+                const uint gk = k0 + r;
+                const uint gn = n0 + c;
+                float      v  = 0.0;
+                if (gk < pc.k && gn < pc.n) {
+                    v = data_b[pc.base_b + off_b + gn * pc.nb_b1 + gk * pc.nb_b0];
+                }
+                Bs[r][c] = v;
+            }
+            barrier();
+
+            for (uint kk = 0; kk < BK; ++kk) {
+                for (uint i = 0; i < TM; ++i) {
+                    for (uint j = 0; j < TN; ++j) {
+                        acc[i][j] += As[ty4 + i][kk] * Bs[kk][tx4 + j];
+                    }
+                }
+            }
+            barrier();
+        }
+
+        for (uint i = 0; i < TM; ++i) {
+            const uint gm = m0 + ty4 + i;
+            if (gm >= pc.m) {
+                continue;
+            }
+            for (uint j = 0; j < TN; ++j) {
+                const uint gn = n0 + tx4 + j;
+                if (gn >= pc.n) {
+                    continue;
+                }
+                data_d[pc.base_d + off_d + gm * pc.nb_d0 + gn * pc.nb_d1] = acc[i][j];
+            }
+        }
+    }
+}

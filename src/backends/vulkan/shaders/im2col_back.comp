@@ -1,0 +1,99 @@
+#version 450
+// train.cpp - Vulkan im2col 反向 kernel（对输入图像的梯度；F32）
+// 语义与 ggml_im2col_back / CPU compute_im2col_back 一致：
+//   输入：grad=[feat,OW,OH,N]（1D 时 ne2=N）、kernel（仅取 KH/KW 形状）-> 输出图像
+//   图像位置 gather：tmpw=iiw+p0-ikw*d0 必须 >=0、能被 s0 整除且 iow<OW；高度方向同理（仅 2D）
+// push constant 布局必须与 C++ 端 VulkanIm2ColPC 一致（108 字节，与 im2col 共用）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint feat;  // IC*KH*KW
+    uint OW;
+    uint OH;
+    uint N;
+    uint IC;
+    uint IH;
+    uint IW;
+    uint KH;
+    uint KW;
+    int  s0;
+    int  s1;
+    int  p0;
+    int  p1;
+    int  d0;
+    int  d1;
+    uint is_2d;
+    uint nb_img[4];  // grad 的步长（img 命名沿用共用结构）
+    uint nb_d[4];    // 输出图像的步长
+    uint base_img;   // grad 基址
+    uint base_d;     // 输出图像基址
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer G { float data_g[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        // 图像元素下标：2D [IW,IH,IC,N]，1D [IW,IC,N,1]
+        uint r = i;
+        const uint iiw = r % pc.IW;  r /= pc.IW;
+        uint       iih    = 0;
+        uint       iic    = 0;
+        uint       in_idx = 0;
+        if (pc.is_2d != 0u) {
+            iih    = r % pc.IH;  r /= pc.IH;
+            iic    = r % pc.IC;  r /= pc.IC;
+            in_idx = r;
+        } else {
+            iic    = r % pc.IC;  r /= pc.IC;
+            in_idx = r;
+        }
+
+        const uint khkw = pc.KH * pc.KW;
+        float      sum  = 0.0;
+        for (uint ikh = 0; ikh < pc.KH; ++ikh) {
+            uint ioh = 0;
+            if (pc.is_2d != 0u) {
+                const int tmph = int(iih) + pc.p1 - int(ikh) * pc.d1;
+                if (tmph < 0 || (tmph % pc.s1) != 0) {
+                    continue;
+                }
+                ioh = uint(tmph / pc.s1);
+                if (ioh >= pc.OH) {
+                    continue;
+                }
+            }
+            for (uint ikw = 0; ikw < pc.KW; ++ikw) {
+                const int tmpw = int(iiw) + pc.p0 - int(ikw) * pc.d0;
+                if (tmpw < 0 || (tmpw % pc.s0) != 0) {
+                    continue;
+                }
+                const uint iow = uint(tmpw / pc.s0);
+                if (iow >= pc.OW) {
+                    continue;
+                }
+                const uint g0 = iic * khkw + ikh * pc.KW + ikw;
+                // 1D：N 在 nb_g[2]（ioh=0）；2D：ioh 在 nb_g[2]、N 在 nb_g[3]
+                const uint off_g = pc.base_img + g0 * pc.nb_img[0] + iow * pc.nb_img[1] +
+                                   ((pc.is_2d != 0u) ? (ioh * pc.nb_img[2] + in_idx * pc.nb_img[3])
+                                                     : (in_idx * pc.nb_img[2]));
+                sum += data_g[off_g];
+            }
+        }
+
+        // 1D：IC 在 nb_d[1]、N 在 nb_d[2]；2D：IC 在 nb_d[2]、N 在 nb_d[3]
+        const uint off_d = pc.base_d + iiw * pc.nb_d[0] + iih * pc.nb_d[1] +
+                           iic * pc.nb_d[(pc.is_2d != 0u) ? 2u : 1u] +
+                           in_idx * pc.nb_d[(pc.is_2d != 0u) ? 3u : 2u];
+        data_d[off_d] = sum;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

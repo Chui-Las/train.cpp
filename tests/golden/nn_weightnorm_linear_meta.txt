@@ -1,0 +1,4 @@
+kind weightnorm_linear
+has_bias 0
+in_features 4
+out_features 3

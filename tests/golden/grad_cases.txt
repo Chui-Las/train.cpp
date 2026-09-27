@@ -1,0 +1,159 @@
+case grad_mlp_mse 6
+in 0 f32 3x4x1x1
+in 1 f32 3x5x1x1
+in 2 f32 5x1x1x1
+in 3 f32 5x2x1x1
+in 4 f32 2x1x1x1
+in 5 f32 2x4x1x1
+param 1
+param 2
+param 3
+param 4
+node 6 mul_mat 0 2 1 0
+node 7 add 0 2 6 2
+node 8 relu 0 1 7
+node 9 mul_mat 0 2 3 8
+node 10 add 0 2 9 4
+node 11 sub 0 2 10 5
+node 12 sqr 0 1 11
+node 13 sum 0 1 12
+node 14 scale 1 0.125 1 13
+loss 14
+case grad_mul_mat_batch 2
+in 0 f32 3x2x1x1
+in 1 f32 3x4x2x2
+param 0
+param 1
+node 2 mul_mat 0 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_mul_mat_batch_div 2
+in 0 f32 2x2x2x1
+in 1 f32 2x3x4x1
+param 0
+param 1
+node 2 mul_mat 0 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_conv_transpose_1d 2
+in 0 f32 3x2x2x1
+in 1 f32 5x2x1x1
+param 0
+param 1
+node 2 conv_transpose_1d 3 2 0 1 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_pad_reflect 1
+in 0 f32 4x3x1x1
+param 0
+node 1 pad_reflect 8 2 1 1 1 0 0 0 0 1 0
+node 2 sqr 0 1 1
+node 3 sum 0 1 2
+loss 3
+case grad_pool_2d_avg 1
+in 0 f32 4x3x1x1
+param 0
+node 1 pool_2d 7 1 2 2 1 1 1 1 1 0
+node 2 sqr 0 1 1
+node 3 sum 0 1 2
+loss 3
+case grad_pool_2d_max 1
+in 0 f32 4x3x1x1
+param 0
+node 1 pool_2d 7 0 2 2 1 1 1 1 1 0
+node 2 sqr 0 1 1
+node 3 sum 0 1 2
+loss 3
+case grad_conv_transpose_2d 2
+in 0 f32 2x2x2x2
+in 1 f32 3x2x2x1
+param 0
+param 1
+node 2 conv_transpose_2d 1 1 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_conv_transpose_2d_s2 2
+in 0 f32 3x2x2x2
+in 1 f32 3x2x2x1
+param 0
+param 1
+node 2 conv_transpose_2d 1 2 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_norm_gelu 2
+in 0 f32 4x3x1x1
+in 1 f32 4x3x1x1
+param 0
+param 1
+node 2 norm 1 1e-05 1 0
+node 3 gelu_erf 0 1 2
+node 4 mul 0 2 3 1
+node 5 sum 0 1 4
+loss 5
+case grad_conv2d 2
+in 0 f32 3x2x2x1
+in 1 f32 4x4x2x1
+param 0
+param 1
+node 2 conv_2d 6 1 1 1 1 1 1 2 0 1
+node 3 relu 0 1 2
+node 4 sqr 0 1 3
+node 5 sum 0 1 4
+loss 5
+case grad_softmax 2
+in 0 f32 5x3x1x1
+in 1 f32 5x3x1x1
+param 0
+node 2 soft_max_ext 2 0.7 0.0 2 0 1
+node 3 mul 0 2 2 1
+node 4 sum 0 1 3
+loss 4
+case grad_embedding 2
+in 0 f32 4x5x1x1
+in 1 i32 4x1x1x1
+param 0
+node 2 get_rows 0 2 0 1
+node 3 sqr 0 1 2
+node 4 sum 0 1 3
+loss 4
+case grad_broadcast 3
+in 0 f32 2x3x1x1
+in 1 f32 1x3x1x1
+in 2 f32 3x1x1x1
+param 0
+param 1
+param 2
+node 3 concat 1 0 2 0 1
+node 4 add 0 2 3 2
+node 5 sqr 0 1 4
+node 6 sum 0 1 5
+node 7 mean 0 1 0
+node 8 sum 0 1 7
+node 9 add 0 2 6 8
+loss 9
+case grad_cross_entropy 2
+in 0 f32 5x3x1x1
+in 1 f32 5x3x1x1
+param 0
+node 2 cross_entropy_loss 0 2 0 1
+loss 2
+case grad_cross_entropy_mlp 5
+in 0 f32 3x2x1x1
+in 1 f32 3x4x1x1
+in 2 f32 4x1x1x1
+in 3 f32 4x3x1x1
+in 4 f32 3x2x1x1
+param 1
+param 2
+param 3
+node 5 mul_mat 0 2 1 0
+node 6 add 0 2 5 2
+node 7 relu 0 1 6
+node 8 mul_mat 0 2 3 7
+node 9 cross_entropy_loss 0 2 8 4
+loss 9

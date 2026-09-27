@@ -1,0 +1,7 @@
+kind convtranspose1d
+has_bias 1
+in_channels 2
+out_channels 3
+kernel 4
+stride0 2
+padding0 1

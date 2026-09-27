@@ -1,0 +1,45 @@
+#version 450
+// train.cpp - Vulkan 全元素求和 kernel（sum；单 workgroup，输出 1 元素）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne[4];
+    uint nb_a[4];
+    uint base_a;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+shared float sdata[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.numel; i += 256u) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne[d];
+            rem /= pc.ne[d];
+        }
+        uint off_a = pc.base_a;
+        for (int d = 0; d < 4; ++d) {
+            off_a += idx[d] * pc.nb_a[d];
+        }
+        acc += data_a[off_a];
+    }
+    sdata[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        data_d[pc.base_d] = sdata[0];
+    }
+}

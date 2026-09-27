@@ -1,0 +1,64 @@
+#version 450
+// train.cpp - Vulkan 二元逐元素 kernel（F32；结果形状取 a，b 按 ggml 广播规则可重复）
+// push constant 布局必须与 C++ 端 VulkanBinaryPC 一致（100 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint op;
+    uint ne_a[4];  // 结果形状（= a 的形状）
+    uint ne_b[4];
+    uint nb_a[4];  // 元素单位步长
+    uint nb_b[4];
+    uint nb_d[4];
+    uint base_a;
+    uint base_b;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) readonly buffer B { float data_b[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+// 算子码（必须与 C++ 端 VulkanBinaryOp 一致）
+#define TRC_BOP_ADD 0u
+#define TRC_BOP_SUB 1u
+#define TRC_BOP_MUL 2u
+#define TRC_BOP_DIV 3u
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne_a[d];
+            rem /= pc.ne_a[d];
+        }
+        uint off_a = pc.base_a;
+        uint off_b = pc.base_b;
+        uint off_d = pc.base_d;
+        for (int d = 0; d < 4; ++d) {
+            off_a += idx[d] * pc.nb_a[d];
+            off_d += idx[d] * pc.nb_d[d];
+            if (pc.ne_b[d] != 1u) {
+                off_b += idx[d] * pc.nb_b[d];
+            }
+        }
+        const float a = data_a[off_a];
+        const float b = data_b[off_b];
+        float r;
+        if (pc.op == TRC_BOP_ADD)      r = a + b;
+        else if (pc.op == TRC_BOP_SUB) r = a - b;
+        else if (pc.op == TRC_BOP_MUL) r = a * b;
+        else                           r = a / b;
+        data_d[off_d] = r;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

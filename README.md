@@ -1,0 +1,113 @@
+# traincpp
+
+通用 C++20 深度学习**训练**库。核心与后端分离：核心提供张量、计算图、自动求导、网络层、损失、优化器与模型 I/O；后端（CPU 参考后端、Vulkan 后端）只负责设备与 kernel。库本体不使用任何第三方运行时依赖；Vulkan 后端为可选组件，仅依赖 Vulkan SDK。
+
+**定位**：在没有 CUDA 或设备异构的环境中训练模型；让训练产物直接进入 ggml 推理生态；或作为可嵌入、可审计的 C++ 训练内核。
+
+## 主要特性
+
+**训练**
+
+- 自动求导：反向为前向算子的组合，一次 `graph_compute` 同时完成前向与反向。
+- 优化器：SGD、AdamW（数值语义对齐 PyTorch），支持参数分组与训练中动态加组。
+- 学习率调度：StepLR、ExponentialLR、CosineAnnealingLR，以及 warmup + cosine。
+- 梯度累积（micro-batch）与全局 L2 梯度裁剪。
+- 10 类网络层：`Linear` / `Embedding` / `Conv1d`（支持分组）/ `Conv2d` / `ConvTranspose1d` / `WeightNorm` / `LayerNorm` / `RmsNorm` / `GroupNorm` / `Dropout`。
+- 损失：MSE、L1、交叉熵。
+
+**后端**
+
+- CPU 参考后端（正确性优先）与 Vulkan 后端（GPU），同一份代码跨设备运行。
+- 能力查询与整图预检：`Device::supports_op` / `graph_first_unsupported`；不支持的算子或类型组合会明确中止，不会静默跳过或错算。
+
+**互操作**
+
+- 数据类型取值、张量内存布局（`ne` / `nb`）、算子语义与 ggml v0.23.0 对齐。
+- 训练产物导出 **GGUF**，可被 ggml 生态程序直接加载；可读取含常见量化（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0）的 GGUF 用于热启动 / 微调。
+- checkpoint 保存参数、优化器状态、随机数与调度器，断点续训与不中断训练逐位一致。
+
+**工程**
+
+- 15 个公共头、70+ 算子构造函数；CMake ≥ 3.20；支持 `add_subdirectory` 与 `find_package` 集成。
+- 库不需要显式初始化，首次使用设备时自动完成注册。
+
+## 快速了解
+
+**演示程序（`examples/`）**
+
+- `demo_image_train` / `demo_image_classify`：训练一个小型 CNN 做**图像分类**并导出模型，再对图片输出类别与置信度。内置合成数据开箱即用，也可使用自备的“按类别分文件夹”的图片；`--device gpu` 走 Vulkan。
+- `example_train`：MLP 训练 + checkpoint 断点续训 + GGUF 导出回读。
+- `example_basic`：最小前向计算。
+
+**测试**
+
+- 24 个测试程序、47 个 CTest 用例（启用 Vulkan 时；关闭时 23），其中包含 13 个“中止 / 死亡测试”，用于固定错误路径必须中止的语义。
+- 与 PyTorch 的黄金数据对拍：前向 61 例、反向组合图 16 例，另有优化器轨迹、网络层、损失与逐 epoch 训练轨迹。
+- CPU 与 Vulkan 的后端一致性对照（16 组）。
+- 规模压力套件（逐元素 / 索引 / 卷积 / batch matmul，默认小档）。
+- 对拍数据随仓库提供，clone 后无需本机 PyTorch 即可运行全部测试。
+
+## 核心概念（简述）
+
+- **Context**：张量元数据的分配器；`no_alloc` 模式下张量数据由后端 buffer 统一分配。
+- **Tensor**：四维 `ne` / `nb` 布局（`ne[0]` 最内层）；`tensor_set` / `tensor_get` 为原始缓冲区字节语义。
+- **Graph**：由输出后序展开；固定顺序为 前向展开 → 反向展开 → 分配 → 每步 `graph_reset` + `graph_compute`。
+- **Device / Buffer / BufferType**：后端抽象；图级内存复用 `buffer_alloc_graph_tensors` 可降低峰值。
+- **参数与损失**：`tensor_set_param` / `tensor_set_loss` 标记，梯度写入持久累加器并支持累积。
+
+更完整的对象模型与能力总览见《核心概念与功能概览》。
+
+## 鲜明的特点（优点与代价）
+
+- **与 ggml 对齐**：训练产物可直接进入 ggml 推理生态。代价是数据类型、布局与算子语义需跟随 ggml 的约定。
+- **同一份代码跨后端**：CPU 与 Vulkan 都能训练。代价是 Vulkan 的支持范围窄于 CPU（例如 `cast` 仅 F32↔F16、索引仅 I32、`pool_2d_back` 无 Vulkan 实现）。
+- **库本体零依赖**：易嵌入、易审计。代价是不提供具体模型结构、数据预处理管线与权重格式转换工具。
+- **训练组件在主机端实现**：与后端解耦、CPU/Vulkan 通用。代价是每步存在主机读写开销；设备端优化器与 device-local / staging 训练在后续规划中。
+- **计算以 F32 为主**：正确性优先、行为可预期。代价是暂无混合精度（AMP）与量化训练。
+
+## 平台与依赖
+
+| 项目 | 要求 |
+|---|---|
+| 操作系统 | 核心为可移植 C++20；当前验证平台为 Windows 11 |
+| 编译器 | 支持 C++20（当前验证 MSVC 19.5x） |
+| 构建 | CMake ≥ 3.20（推荐 Ninja） |
+| 可选 | Vulkan SDK（启用 Vulkan 后端，需要 `glslc`） |
+| 可选 | Python + PyTorch（仅用于重新生成测试数据） |
+
+构建方式见[构建与集成](docs/构建与集成.md)。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [构建与集成](docs/构建与集成.md) | 系统与工具链要求、CMake 选项与预设、作为库集成 |
+| [快速开始](docs/快速开始.md) | 最短路径：构建、前向计算、训练循环 |
+| [核心概念与功能概览](docs/核心概念与功能概览.md) | 定位与能力概览、Context / Tensor / Graph / Device 模型 |
+| [算子参考](docs/算子参考.md) | 全部算子的签名、语义、支持矩阵与限制 |
+| [自动求导与训练](docs/自动求导与训练.md) | 参数与损失标记、反向展开、训练循环、梯度累积与裁剪、多图训练 |
+| [优化器与调度](docs/优化器与调度.md) | SGD / AdamW、参数分组、学习率调度 |
+| [神经网络层](docs/神经网络层.md) | 各层的权重布局、初始化、前向与参数收集 |
+| [损失函数](docs/损失函数.md) | MSE / L1 / 交叉熵 |
+| [后端与内存](docs/后端与内存.md) | 设备选择、能力查询、内存核算、图级内存复用与回收 |
+| [模型导出与加载](docs/模型导出与加载.md) | GGUF 写出、读取与反量化 |
+| [断点续训](docs/断点续训.md) | checkpoint 保存、加载、探测与多优化器 |
+| [示例程序](docs/示例程序.md) | 示例与演示程序的用途、数据格式与运行方式 |
+| [测试](docs/测试.md) | 测试框架、各测试程序的用途与边界、黄金数据与 CTest |
+| [功能与限制](docs/功能与限制.md) | 能力速查、负向清单与规模边界 |
+| [兼容性](docs/兼容性.md) | 与 ggml 的逐条对照与差异 |
+| [问题排查](docs/问题排查.md) | 断言与报错含义、故障定位 |
+| [API 参考](docs/API参考.md) | 各头文件的主要 API 速查 |
+
+## 已知限制
+
+- 计算以 **F32** 为主；F16 仅部分路径可用于存储与转换；量化类型不参与计算。
+- 不支持混合精度训练、量化训练与量化导出、分布式训练、梯度检查点、flash attention、`out_prod`。
+- 量化读取仅支持 5 种 legacy 格式（Q4_0/Q4_1/Q5_0/Q5_1/Q8_0），不支持 K-quant / IQ。
+- 部分能力仅 CPU 可用，或仅作反向结果使用（见《功能与限制》与《算子参考》）。
+- 线程安全未承诺：`Context` / `Graph` / `Device` 不应跨线程并发使用。
+
+## 兼容性与许可
+
+- 与 ggml 的 dtype / 布局 / 算子语义对照及差异：见[兼容性](docs/兼容性.md)。
+- 许可：MIT，见 [LICENSE](LICENSE)；第三方许可与致谢见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

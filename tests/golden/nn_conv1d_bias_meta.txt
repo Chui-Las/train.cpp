@@ -1,0 +1,8 @@
+kind conv1d
+has_bias 1
+in_channels 2
+out_channels 2
+kernel 3
+stride0 1
+padding0 1
+dilation0 1

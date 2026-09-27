@@ -1,0 +1,4 @@
+kind embedding
+has_bias 0
+num_embeddings 6
+embedding_dim 4

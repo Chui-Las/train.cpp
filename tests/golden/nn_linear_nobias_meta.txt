@@ -1,0 +1,4 @@
+kind linear
+has_bias 0
+in_features 3
+out_features 4

@@ -1,0 +1,4 @@
+kind rmsnorm
+has_bias 0
+normalized_size 4
+eps 1e-05

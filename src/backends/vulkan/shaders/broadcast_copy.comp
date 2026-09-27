@@ -1,0 +1,42 @@
+#version 450
+// train.cpp - Vulkan 广播拷贝 kernel（repeat；源各维可整除目标各维）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne_s[4];
+    uint ne_d[4];
+    uint nb_s[4];
+    uint nb_d[4];
+    uint base_s;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer S { float data_s[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne_d[d];
+            rem /= pc.ne_d[d];
+        }
+        uint off_s = pc.base_s;
+        uint off_d = pc.base_d;
+        for (int d = 0; d < 4; ++d) {
+            off_s += (idx[d] % pc.ne_s[d]) * pc.nb_s[d];
+            off_d += idx[d] * pc.nb_d[d];
+        }
+        data_d[off_d] = data_s[off_s];
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

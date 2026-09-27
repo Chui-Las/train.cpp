@@ -1,0 +1,52 @@
+#version 450
+// train.cpp - Vulkan repeat 反向 kernel（沿被重复维求和回目标形状）
+// 每个目标元素由线程独立处理：遍历 reps[d] 组合（a.ne[d] = dst.ne[d] * reps[d]）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne_d[4];
+    uint reps[4];
+    uint nb_a[4];
+    uint nb_d[4];
+    uint base_a;
+    uint base_d;
+    uint numel_d;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel_d) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne_d[d];
+            rem /= pc.ne_d[d];
+        }
+        const uint count = pc.reps[0] * pc.reps[1] * pc.reps[2] * pc.reps[3];
+        float acc = 0.0;
+        for (uint m = 0; m < count; ++m) {
+            uint mm[4];
+            uint r = m;
+            for (int d = 0; d < 4; ++d) {
+                mm[d] = r % pc.reps[d];
+                r /= pc.reps[d];
+            }
+            uint off_a = pc.base_a;
+            for (int d = 0; d < 4; ++d) {
+                off_a += (idx[d] + mm[d] * pc.ne_d[d]) * pc.nb_a[d];
+            }
+            acc += data_a[off_a];
+        }
+        data_d[pc.base_d + i] = acc;
+
+        if (pc.numel_d - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

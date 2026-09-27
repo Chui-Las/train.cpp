@@ -1,0 +1,9 @@
+kind cosine
+lr 0.1
+steps 6
+step_size 1
+gamma 1.0
+t_max 5
+eta_min 0.01
+warmup 0
+total 0

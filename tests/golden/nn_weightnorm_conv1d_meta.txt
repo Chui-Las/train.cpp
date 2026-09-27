@@ -1,0 +1,7 @@
+kind weightnorm_conv1d
+has_bias 0
+in_channels 2
+out_channels 3
+kernel 3
+stride0 1
+padding0 0

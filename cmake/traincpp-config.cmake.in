@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+# train.cpp (traincpp) 的 CMake 包配置
+# 用法：
+#   find_package(traincpp CONFIG REQUIRED)
+#   target_link_libraries(你的程序 PRIVATE traincpp::traincpp)
+include(CMakeFindDependencyMacro)
+if("@TRC_VULKAN@" STREQUAL "ON")
+    find_dependency(Vulkan COMPONENTS glslc)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/traincppTargets.cmake")
+
+check_required_components(traincpp)

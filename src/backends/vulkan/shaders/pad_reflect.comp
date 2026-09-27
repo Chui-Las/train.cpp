@@ -1,0 +1,50 @@
+#version 450
+// train.cpp - Vulkan pad reflect kernel（M2.3c，F32）
+// 语义与 torch F.pad(mode='reflect') 一致：y[i] = x[reflect(i - lp)]（不重复边缘；
+// 每侧填充量 < 对应维长度）。输出每个元素一次 gather，无需清零。
+// push constant 布局必须与 C++ 端 VulkanPadReflectPC 一致（19×uint = 76 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne_d[4];  // 输出形状（本内核迭代域）
+    uint ne_a[4];  // 输入形状
+    uint lp[4];    // 每维左填充
+    uint nb_a[4];  // 输入元素单位步长
+    uint base_a;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne_d[d];
+            rem /= pc.ne_d[d];
+        }
+        uint off_a = pc.base_a;
+        for (int d = 0; d < 4; ++d) {
+            int j = int(idx[d]) - int(pc.lp[d]);
+            if (j < 0) {
+                j = -j;
+            } else if (j >= int(pc.ne_a[d])) {
+                j = 2 * int(pc.ne_a[d]) - 2 - j;
+            }
+            off_a += uint(j) * pc.nb_a[d];
+        }
+        // pad 输出恒为新建连续张量：线性下标即元素偏移
+        data_d[pc.base_d + i] = data_a[off_a];
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

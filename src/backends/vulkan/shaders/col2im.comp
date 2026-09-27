@@ -1,0 +1,60 @@
+#version 450
+// train.cpp - Vulkan col2im_1d kernel（F32）
+// 语义与 ggml_col2im_1d / CPU compute_col2im_1d 一致：src=[K*OC, T_in] -> dst=[T_out, OC]（gather）
+//   t_abs = t_out + p0；t_min = max(0, (t_abs-K+1+s0-1)/s0)；t_max = min(T_in-1, t_abs/s0)
+//   sum += src[(o*K+k)*nb_s0 + t_in*nb_s1]，k = t_abs - t_in*s0 且 0<=k<K
+// push constant 布局必须与 C++ 端 VulkanCol2ImPC 一致（52 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint K;
+    uint OC;
+    uint T_in;
+    int  s0;
+    int  p0;
+    uint nb_s0;
+    uint nb_s1;
+    uint nb_d0;
+    uint nb_d1;
+    uint base_s;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer S { float data_s[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        const uint o     = i % pc.OC;
+        const uint t_out = i / pc.OC;
+
+        const int t_abs = int(t_out) + pc.p0;
+        int       t_max = t_abs / pc.s0;
+        if (t_max >= int(pc.T_in)) {
+            t_max = int(pc.T_in) - 1;
+        }
+        const int t_min_num = t_abs - int(pc.K) + 1 + pc.s0 - 1;
+        int       t_min     = 0;
+        if (t_min_num > 0) {
+            t_min = t_min_num / pc.s0;
+        }
+
+        float sum = 0.0;
+        for (int t_in = t_min; t_in <= t_max; ++t_in) {
+            const int k = t_abs - t_in * pc.s0;
+            if (k >= 0 && k < int(pc.K)) {
+                sum += data_s[pc.base_s + uint(o * pc.K + uint(k)) * pc.nb_s0 + uint(t_in) * pc.nb_s1];
+            }
+        }
+        data_d[pc.base_d + t_out * pc.nb_d0 + o * pc.nb_d1] = sum;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

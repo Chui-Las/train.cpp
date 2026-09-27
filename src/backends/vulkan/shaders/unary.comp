@@ -1,0 +1,114 @@
+#version 450
+// train.cpp - Vulkan 一元逐元素 kernel（F32；通过 nb 支持视图，广播由调用方保证形状一致）
+// push constant 布局必须与 C++ 端 VulkanUnaryPC 一致（72 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint  op;
+    uint  ne[4];
+    uint  nb_a[4];  // 元素单位步长
+    uint  nb_d[4];
+    uint  base_a;   // 相对 descriptor offset 的元素基址
+    uint  base_d;
+    uint  numel;
+    float p0;
+    float p1;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) writeonly buffer D { float data_d[]; };
+
+// 算子码（必须与 C++ 端 VulkanUnaryOp 一致）
+#define TRC_UOP_NEG        0u
+#define TRC_UOP_ABS        1u
+#define TRC_UOP_SQR        2u
+#define TRC_UOP_SQRT       3u
+#define TRC_UOP_EXP        4u
+#define TRC_UOP_LOG        5u
+#define TRC_UOP_SIN        6u
+#define TRC_UOP_COS        7u
+#define TRC_UOP_RELU       8u
+#define TRC_UOP_SIGMOID    9u
+#define TRC_UOP_TANH       10u
+#define TRC_UOP_SILU       11u
+#define TRC_UOP_GELU       12u
+#define TRC_UOP_GELU_ERF   13u
+#define TRC_UOP_ERF        14u
+#define TRC_UOP_SOFTPLUS   15u
+#define TRC_UOP_HARDSWISH  16u
+#define TRC_UOP_SGN        17u
+#define TRC_UOP_STEP       18u
+#define TRC_UOP_LEAKY_RELU 19u
+#define TRC_UOP_CLAMP      20u
+#define TRC_UOP_SCALE      21u
+
+// erf 近似（Abramowitz & Stegun 7.1.26，与 ggml Vulkan unary shader 同系数；最大误差 ~1.5e-7）
+float trc_erf(float x) {
+    const float p  = 0.3275911;
+    const float a1 = 0.254829592;
+    const float a2 = -0.284496736;
+    const float a3 = 1.421413741;
+    const float a4 = -1.453152027;
+    const float a5 = 1.061405429;
+    const float s  = x < 0.0 ? -1.0 : 1.0;
+    const float ax = abs(x);
+    const float t  = 1.0 / (1.0 + p * ax);
+    const float y  = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return s * y;
+}
+
+float trc_unary(float x) {
+    if (pc.op == TRC_UOP_NEG)        return -x;
+    if (pc.op == TRC_UOP_ABS)        return abs(x);
+    if (pc.op == TRC_UOP_SQR)        return x * x;
+    if (pc.op == TRC_UOP_SQRT)       return sqrt(x);
+    if (pc.op == TRC_UOP_EXP)        return exp(x);
+    if (pc.op == TRC_UOP_LOG)        return log(x);
+    if (pc.op == TRC_UOP_SIN)        return sin(x);
+    if (pc.op == TRC_UOP_COS)        return cos(x);
+    if (pc.op == TRC_UOP_RELU)       return x > 0.0 ? x : 0.0;
+    if (pc.op == TRC_UOP_SIGMOID)    return 1.0 / (1.0 + exp(-x));
+    if (pc.op == TRC_UOP_TANH)       return tanh(x);
+    if (pc.op == TRC_UOP_SILU)       return x / (1.0 + exp(-x));
+    // 与 ggml/CPU 一致：tanh 近似
+    if (pc.op == TRC_UOP_GELU) {
+        return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+    }
+    if (pc.op == TRC_UOP_GELU_ERF)   return 0.5 * x * (1.0 + trc_erf(x * 0.70710678118654752440));
+    if (pc.op == TRC_UOP_ERF)        return trc_erf(x);
+    // 与 ggml 一致：x > 20 时直接返回 x，避免 exp 溢出
+    if (pc.op == TRC_UOP_SOFTPLUS)   return x > 20.0 ? x : log(1.0 + exp(x));
+    if (pc.op == TRC_UOP_HARDSWISH)  return x * min(max(x + 3.0, 0.0), 6.0) / 6.0;
+    if (pc.op == TRC_UOP_SGN)        return x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0);
+    if (pc.op == TRC_UOP_STEP)       return x > 0.0 ? 1.0 : 0.0;
+    if (pc.op == TRC_UOP_LEAKY_RELU) return x > 0.0 ? x : pc.p0 * x;
+    if (pc.op == TRC_UOP_CLAMP)      return min(max(x, pc.p0), pc.p1);
+    if (pc.op == TRC_UOP_SCALE)      return x * pc.p0;
+    return x;
+}
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne[d];
+            rem /= pc.ne[d];
+        }
+        uint off_a = pc.base_a;
+        uint off_d = pc.base_d;
+        for (int d = 0; d < 4; ++d) {
+            off_a += idx[d] * pc.nb_a[d];
+            off_d += idx[d] * pc.nb_d[d];
+        }
+        data_d[off_d] = trc_unary(data_a[off_a]);
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

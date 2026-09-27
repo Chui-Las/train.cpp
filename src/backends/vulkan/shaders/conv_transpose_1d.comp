@@ -1,0 +1,69 @@
+#version 450
+// train.cpp - Vulkan conv_transpose_1d kernel（F32）
+// 语义与 ggml_conv_transpose_1d / CPU compute_conv_transpose_1d 一致：
+//   kernel=[K, Cout, Cin]、input=[T_in, Cin]（2D）-> dst=[T_out, Cout, 1, 1]（T_out=(T_in-1)*s0+K；p0=0、d0=1）
+//   每个输出 (t_out, co) 独立求和，无需 atomic
+// push constant 布局必须与 C++ 端 VulkanConvTranspose1DPC 一致（64 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint K;
+    uint Cout;
+    uint Cin;
+    uint T_in;
+    int  s0;
+    uint nb_k0;
+    uint nb_k1;
+    uint nb_k2;
+    uint nb_x0;
+    uint nb_x1;
+    uint nb_d0;
+    uint nb_d1;
+    uint base_k;
+    uint base_x;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer K { float data_k[]; };
+layout(std430, binding = 1) readonly buffer X { float data_x[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        const uint co    = i % pc.Cout;
+        const uint t_out = i / pc.Cout;
+
+        const int t_abs = int(t_out);
+        int       t_max = t_abs / pc.s0;
+        if (t_max >= int(pc.T_in)) {
+            t_max = int(pc.T_in) - 1;
+        }
+        const int t_min_num = t_abs - int(pc.K) + 1 + pc.s0 - 1;
+        int       t_min     = 0;
+        if (t_min_num > 0) {
+            t_min = t_min_num / pc.s0;
+        }
+
+        float acc = 0.0;
+        for (int t = t_min; t <= t_max; ++t) {
+            const int k = t_abs - t * pc.s0;
+            if (k >= 0 && k < int(pc.K)) {
+                for (uint ci = 0; ci < pc.Cin; ++ci) {
+                    const uint off_k = pc.base_k + uint(k) * pc.nb_k0 + co * pc.nb_k1 + ci * pc.nb_k2;
+                    const uint off_x = pc.base_x + uint(t) * pc.nb_x0 + ci * pc.nb_x1;
+                    acc += data_k[off_k] * data_x[off_x];
+                }
+            }
+        }
+        data_d[pc.base_d + t_out * pc.nb_d0 + co * pc.nb_d1] = acc;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

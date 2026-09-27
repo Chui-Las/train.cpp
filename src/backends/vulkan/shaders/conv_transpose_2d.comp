@@ -1,0 +1,82 @@
+#version 450
+// train.cpp - Vulkan conv_transpose_2d kernel（F32）
+// 语义与 ggml_conv_transpose_2d_p0 / CPU compute_conv_transpose_2d 一致：
+//   kernel=[KW,KH,Cout,Cin]、input=[W,H,Cin,N] -> dst=[OW,OH,Cout,N]
+//   dst[ow,oh,co,n] = Σ_{kh,kw,ci} W[kw,kh,co,ci]*X[iw,ih,ci,n]
+//     （iw=(ow-kw)/stride、ih=(oh-kh)/stride，需整除且在界内；p=0、d=1）
+//   每个输出元素独立 gather，无需 atomic
+// push constant 布局必须与 C++ 端 VulkanConvTranspose2DPC 一致（104 字节）
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint KW;
+    uint KH;
+    uint Cout;
+    uint Cin;
+    uint W;
+    uint H;
+    uint N;
+    uint OW;
+    uint OH;
+    int  stride;
+    uint nb_w[4];
+    uint nb_x[4];
+    uint nb_d[4];
+    uint base_w;
+    uint base_x;
+    uint base_d;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer W { float data_w[]; };
+layout(std430, binding = 1) readonly buffer X { float data_x[]; };
+layout(std430, binding = 2) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        const uint ow = i % pc.OW;
+        const uint oh = (i / pc.OW) % pc.OH;
+        const uint co = (i / (pc.OW * pc.OH)) % pc.Cout;
+        const uint n  = i / (pc.OW * pc.OH * pc.Cout);
+
+        float acc = 0.0;
+        for (uint kh = 0; kh < pc.KH; ++kh) {
+            const int nh = int(oh) - int(kh);
+            if (nh < 0 || nh % pc.stride != 0) {
+                continue;
+            }
+            const uint ih = uint(nh / pc.stride);
+            if (ih >= pc.H) {
+                continue;
+            }
+            for (uint kw = 0; kw < pc.KW; ++kw) {
+                const int nw = int(ow) - int(kw);
+                if (nw < 0 || nw % pc.stride != 0) {
+                    continue;
+                }
+                const uint iw = uint(nw / pc.stride);
+                if (iw >= pc.W) {
+                    continue;
+                }
+                for (uint ci = 0; ci < pc.Cin; ++ci) {
+                    const uint off_w = pc.base_w + kw * pc.nb_w[0] + kh * pc.nb_w[1] +
+                                       co * pc.nb_w[2] + ci * pc.nb_w[3];
+                    const uint off_x = pc.base_x + iw * pc.nb_x[0] + ih * pc.nb_x[1] +
+                                       ci * pc.nb_x[2] + n * pc.nb_x[3];
+                    acc += data_w[off_w] * data_x[off_x];
+                }
+            }
+        }
+        const uint od = pc.base_d + ow * pc.nb_d[0] + oh * pc.nb_d[1] + co * pc.nb_d[2] +
+                        n * pc.nb_d[3];
+        data_d[od] = acc;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}
