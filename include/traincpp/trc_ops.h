@@ -213,4 +213,40 @@ Tensor* conv_transpose_2d(Context* ctx, Tensor* a, Tensor* b, int stride);
 // dst = a * b（ggml_mul_mat 语义：a 形状 [k, m]，b 形状 [k, n]，结果 [m, n]）
 Tensor* mul_mat(Context* ctx, Tensor* a, Tensor* b);
 
+// ---------------- 设备端优化器步（M4.1；训练扩展，非 ggml 标准算子）----------------
+// 结果 = param 的完整视图（就地更新参数，语义同 acc(inplace)）；op_params 存放主机算好的
+// 当前步标量（float），逐元素运算顺序与 trc_optim.cpp 的主机实现一致，便于 CPU/Vulkan 对拍。
+// 参数（除 param 外）均需连续 F32。
+//
+// AdamW（op_params float[6] = {step_sz=lr/bc1, bc2_sqrt, decay=1-lr*wd, beta1, beta2, eps}）：
+//   m += (g - m) * (1 - beta1)
+//   v  = v * beta2 + g*g * (1 - beta2)
+//   p  = p * decay - step_sz * m / (sqrt(v) / bc2_sqrt + eps)
+Tensor* opt_step_adamw(Context* ctx, Tensor* param, Tensor* grad, Tensor* m, Tensor* v,
+                       float step_sz, float bc2_sqrt, float decay, float beta1, float beta2, float eps);
+
+// SGD（op_params float[6] = {lr, momentum, dampening, weight_decay, nesterov, is_first}）：
+//   d = g + weight_decay * p
+//   momentum != 0: m = is_first ? d : momentum*m + (1-dampening)*d
+//                  d = nesterov ? d + momentum*m : m
+//   p -= lr * d
+Tensor* opt_step_sgd(Context* ctx, Tensor* param, Tensor* grad, Tensor* momentum,
+                     float lr, float momentum_coef, float dampening, float weight_decay,
+                     bool nesterov, bool is_first);
+
+// ---------------- 设备端梯度裁剪原语（M4.5；训练扩展，非 ggml 标准算子）----------------
+// 均为就地副作用算子（结果 = 输入张量的完整视图，语义同 opt_step/acc(inplace)），要求连续 F32。
+// 供 optim_clip_grad_norm 在设备端完成"全局平方和累积 + 就地缩放"，避免主机 O(参数) 扫描。
+//
+// sum_sqr_acc(acc, a)：acc[0] += Σ a²（acc 为 1 元素 F32，可跨多个梯度张量顺序累积；结果 = acc 视图）
+Tensor* sum_sqr_acc(Context* ctx, Tensor* acc, Tensor* a);
+
+// clip_scale_inplace(a, norm)：a *= min(1, max_norm / (sqrt(norm[0]) + eps))（norm 为 1 元素 F32；
+// 未超门限时值为 1，即不影响；结果 = a 完整视图）
+Tensor* clip_scale_inplace(Context* ctx, Tensor* a, Tensor* norm, float max_norm, float eps);
+
+// ---------------- 设备端 WeightNorm 同步（M4.5；结果 = g 完整视图）----------------
+// 逐输出通道 g[oc] = sqrt(Σ_rest v²)，与 weightnorm_sync_g 的主机实现逐条一致（v/g 连续 F32）。
+Tensor* weightnorm_sync(Context* ctx, Tensor* v, Tensor* g);
+
 } // namespace traincpp

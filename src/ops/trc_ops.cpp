@@ -766,4 +766,95 @@ Tensor* conv_transpose_2d(Context* ctx, Tensor* a, Tensor* b, int stride) {
     return result;
 }
 
+// ---------------- 设备端优化器步（M4.1）----------------
+
+namespace {
+
+// 公共构造：结果 = param 的完整视图（就地更新），src 顺序固定
+Tensor* new_opt_step(Context* ctx, Op op, Tensor* param, Tensor* grad, Tensor* m, Tensor* v,
+                     int n_extra_src) {
+    TRC_ASSERT(param != nullptr && grad != nullptr && m != nullptr, "%s: 输入为空", op_name(op));
+    TRC_ASSERT(param->type == TYPE_F32 && grad->type == TYPE_F32 && m->type == TYPE_F32,
+               "%s: 仅支持 F32", op_name(op));
+    Tensor* result =
+        view_4d(ctx, param, param->ne[0], param->ne[1], param->ne[2], param->ne[3], 0);
+    result->op     = op;
+    result->src[0] = param;
+    result->src[1] = grad;
+    result->src[2] = m;
+    result->src[3] = v;
+    result->nsrc   = 3 + n_extra_src;  // SGD: 3，AdamW: 4
+    return result;
+}
+
+} // namespace
+
+Tensor* opt_step_adamw(Context* ctx, Tensor* param, Tensor* grad, Tensor* m, Tensor* v,
+                       float step_sz, float bc2_sqrt, float decay, float beta1, float beta2,
+                       float eps) {
+    TRC_ASSERT(v != nullptr, "opt_step_adamw: v 为空");
+    TRC_ASSERT(v->type == TYPE_F32, "opt_step_adamw: v 仅支持 F32");
+    Tensor* result = new_opt_step(ctx, OP_OPT_STEP_ADAMW, param, grad, m, v, 1);
+    const float params[6] = {step_sz, bc2_sqrt, decay, beta1, beta2, eps};
+    std::memcpy(result->op_params, params, sizeof(params));
+    return result;
+}
+
+Tensor* opt_step_sgd(Context* ctx, Tensor* param, Tensor* grad, Tensor* momentum, float lr,
+                     float momentum_coef, float dampening, float weight_decay, bool nesterov,
+                     bool is_first) {
+    Tensor* result = new_opt_step(ctx, OP_OPT_STEP_SGD, param, grad, momentum, nullptr, 0);
+    const float params[6] = {lr, momentum_coef, dampening, weight_decay, nesterov ? 1.0f : 0.0f,
+                             is_first ? 1.0f : 0.0f};
+    std::memcpy(result->op_params, params, sizeof(params));
+    return result;
+}
+
+// ---------------- 设备端梯度裁剪原语（M4.5）----------------
+
+Tensor* sum_sqr_acc(Context* ctx, Tensor* acc, Tensor* a) {
+    TRC_ASSERT(acc != nullptr && a != nullptr, "sum_sqr_acc: 输入为空");
+    TRC_ASSERT(acc->type == TYPE_F32 && a->type == TYPE_F32, "sum_sqr_acc: 仅支持 F32");
+    TRC_ASSERT(tensor_nelements(acc) == 1, "sum_sqr_acc: acc 必须是 1 元素");
+    TRC_ASSERT(tensor_is_contiguous(a), "sum_sqr_acc: a 必须连续");
+    // 结果 = acc 的完整视图（就地累加）
+    Tensor* result =
+        view_4d(ctx, acc, acc->ne[0], acc->ne[1], acc->ne[2], acc->ne[3], 0);
+    result->op     = OP_SUM_SQR_ACC;
+    result->src[0] = acc;
+    result->src[1] = a;
+    result->nsrc   = 2;
+    return result;
+}
+
+Tensor* clip_scale_inplace(Context* ctx, Tensor* a, Tensor* norm, float max_norm, float eps) {
+    TRC_ASSERT(a != nullptr && norm != nullptr, "clip_scale_inplace: 输入为空");
+    TRC_ASSERT(a->type == TYPE_F32 && norm->type == TYPE_F32, "clip_scale_inplace: 仅支持 F32");
+    TRC_ASSERT(tensor_nelements(norm) == 1, "clip_scale_inplace: norm 必须是 1 元素");
+    TRC_ASSERT(tensor_is_contiguous(a), "clip_scale_inplace: a 必须连续");
+    // 结果 = a 的完整视图（就地缩放）
+    Tensor* result = view_4d(ctx, a, a->ne[0], a->ne[1], a->ne[2], a->ne[3], 0);
+    result->op     = OP_CLIP_SCALE_INPLACE;
+    result->src[0] = a;
+    result->src[1] = norm;
+    result->nsrc   = 2;
+    const float params[2] = {max_norm, eps};
+    std::memcpy(result->op_params, params, sizeof(params));
+    return result;
+}
+
+Tensor* weightnorm_sync(Context* ctx, Tensor* v, Tensor* g) {
+    TRC_ASSERT(v != nullptr && g != nullptr, "weightnorm_sync: 输入为空");
+    TRC_ASSERT(v->type == TYPE_F32 && g->type == TYPE_F32, "weightnorm_sync: 仅支持 F32");
+    TRC_ASSERT(tensor_is_contiguous(v) && tensor_is_contiguous(g),
+               "weightnorm_sync: v/g 必须连续");
+    // 结果 = g 的完整视图（就地写回各输出通道范数）
+    Tensor* result = view_4d(ctx, g, g->ne[0], g->ne[1], g->ne[2], g->ne[3], 0);
+    result->op     = OP_WEIGHTNORM_SYNC;
+    result->src[0] = v;
+    result->src[1] = g;
+    result->nsrc   = 2;
+    return result;
+}
+
 } // namespace traincpp
