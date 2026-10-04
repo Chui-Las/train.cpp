@@ -1,10 +1,13 @@
 // train.cpp - Vulkan 后端内部头（仅 src/ 内使用）
 //
-// 设计要点（参考 ggml v0.23.0 Vulkan 后端）：
-//   - 每个 Buffer = 一个 VkBuffer + 一个 VkDeviceMemory，host-visible + coherent 并常驻映射；
-//     计算缓冲默认 host-visible（系统内存）；`TRC_VK_DEVICE_LOCAL=1` 才优先 DEVICE_LOCAL（VRAM），
-//     分配/映射失败回退 host-visible；`TRC_VK_HOST_MEMORY=1` 强制 host-visible
-//   - base() 返回真实主机指针：核心的视图读写（tensor_set/get 对视图走主机直传）依赖此语义
+// 设计要点（参考 ggml v0.23.0 Vulkan 后端，见 docs/开发进度.md M1.4）：
+//   - 每个 Buffer = 一个 VkBuffer + 一个 VkDeviceMemory。**默认优先 device-local**（M4.5e）：
+//     不可映射 device-local（真显存）→ 用共享 staging 同步搬运（`base()==nullptr`）；否则可映射
+//     device-local（核显/ReBAR，`base()` 可解引用）；否则 host-visible。`TRC_VK_HOST_MEMORY=1`
+//     强制 host-visible（基线），`TRC_VK_DEVICE_LOCAL=1` 只优先可映射 device-local，
+//     `TRC_VK_FORCE_STAGING=1` 强制 staging（测试）。分配/映射失败回退 host-visible。
+//     （FIX-003 / Q26；M4.4b staging；M4.5e 默认切换）
+//   - base() 在可映射时返回真实主机指针；不可映射（staging）时为 nullptr，主機读写经 Buffer::set/get_tensor
 //   - 逐元素 kernel 通过 push constant 传 ne/nb（元素单位）与基址，支持视图与广播
 //   - descriptor offset 向下对齐到 minStorageBufferOffsetAlignment，错位字节折成元素基址传给 shader
 //     （与 ggml 的 misalign 处理思路一致，M1.4b 简化：要求 F32 且 4 字节对齐）
@@ -432,6 +435,66 @@ struct VulkanAccAddPC {  // acc_add.comp：60 字节
 };
 static_assert(sizeof(VulkanAccAddPC) == 60, "VulkanAccAddPC 布局必须与 acc_add.comp 一致");
 
+// 各张量独立 descriptor（floor 对齐后 base_elem 可能不同），故每个 binding 单列 base
+struct VulkanOptStepAdamwPC {  // opt_step_adamw.comp：76 字节
+    uint32_t ne[4];
+    uint32_t nb[4];  // 元素单位步长（param 连续）
+    uint32_t base_p;
+    uint32_t base_g;
+    uint32_t base_m;
+    uint32_t base_v;
+    uint32_t numel;
+    float    step_sz;   // lr / bc1
+    float    bc2_sqrt;  // sqrt(1 - beta2^t)
+    float    decay;     // 1 - lr*wd
+    float    beta1;
+    float    beta2;
+    float    eps;
+};
+static_assert(sizeof(VulkanOptStepAdamwPC) == 76, "VulkanOptStepAdamwPC 布局必须与 opt_step_adamw.comp 一致");
+
+struct VulkanOptStepSgdPC {  // opt_step_sgd.comp：72 字节
+    uint32_t ne[4];
+    uint32_t nb[4];
+    uint32_t base_p;
+    uint32_t base_g;
+    uint32_t base_m;
+    uint32_t numel;
+    float    lr;
+    float    momentum;   // 动量系数
+    float    dampening;
+    float    weight_decay;
+    float    nesterov;   // 0/1
+    float    is_first;   // 0/1（首个动量步直接取 d）
+};
+static_assert(sizeof(VulkanOptStepSgdPC) == 72, "VulkanOptStepSgdPC 布局必须与 opt_step_sgd.comp 一致");
+
+// M4.5：梯度裁剪原语 / WeightNorm 同步
+struct VulkanSumSqrAccPC {  // sum_sqr_acc.comp：12 字节
+    uint32_t base_a;
+    uint32_t base_acc;
+    uint32_t numel;
+};
+static_assert(sizeof(VulkanSumSqrAccPC) == 12, "VulkanSumSqrAccPC 布局必须与 sum_sqr_acc.comp 一致");
+
+struct VulkanClipScalePC {  // clip_scale_inplace.comp：20 字节
+    uint32_t numel;
+    uint32_t base_a;
+    uint32_t base_norm;
+    float    max_norm;
+    float    eps;
+};
+static_assert(sizeof(VulkanClipScalePC) == 20, "VulkanClipScalePC 布局必须与 clip_scale_inplace.comp 一致");
+
+struct VulkanWeightNormSyncPC {  // weightnorm_sync.comp：16 字节
+    uint32_t numel;
+    uint32_t n_rest;
+    uint32_t base_v;
+    uint32_t base_g;
+};
+static_assert(sizeof(VulkanWeightNormSyncPC) == 16,
+              "VulkanWeightNormSyncPC 布局必须与 weightnorm_sync.comp 一致");
+
 struct VulkanGetRowsPC {  // get_rows.comp：80 字节
     uint32_t ne0;
     uint32_t n_vocab;
@@ -510,6 +573,13 @@ struct VulkanState {
     bool                       integrated = false;
     bool                       unified_memory = false;
     bool                       storage_16bit = false;  // 设备支持 16 位存储（F16 cast 需要）
+    // M4.4b：共享 staging（不可映射 device-local 缓冲的主机↔设备传输，同步提交）
+    VkBuffer                   stage_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory             stage_memory = VK_NULL_HANDLE;
+    void*                      stage_mapped = nullptr;
+    size_t                     stage_size = 0;
+    VkCommandPool              transfer_pool = VK_NULL_HANDLE;
+    VkFence                    transfer_fence = VK_NULL_HANDLE;
     // FIX-004 / Q28：失败诊断上下文（提交失败时输出）
     size_t                     live_buffer_bytes = 0;     // 进程存活计算缓冲字节（VulkanBuffer 构造/析构维护）
     uint32_t                   graph_dispatch_count = 0;  // 本次提交已录制的 dispatch 数（compute_begin 清零）
@@ -544,8 +614,8 @@ public:
 
     BufferType* buffer_type() const override;
     size_t      size() const override { return size_; }
-    void*       base() override { return mapped_; }
-    bool        is_host() const override { return true; }
+    void*       base() override { return mapped_; }   // 不可映射 device-local 缓冲返回 nullptr（M4.4b）
+    bool        is_host() const override { return mapped_ != nullptr; }
 
     void set_tensor(Tensor* t, size_t offset, const void* data, size_t size) override;
     void get_tensor(const Tensor* t, size_t offset, void* data, size_t size) const override;

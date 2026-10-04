@@ -1,0 +1,62 @@
+#version 450
+// train.cpp - Vulkan 设备端 SGD 优化器步（M4.1；PyTorch 语义：momentum/dampening/nesterov/wd）
+// 就地更新参数（binding 0 与 node 的 param 视图共享内存）；逐元素顺序与主机实现一致。
+// 各张量为独立 descriptor，base_* 是各自 floor 对齐后的元素基址，必须分别加。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint ne[4];
+    uint nb[4];  // 元素单位步长
+    uint base_p;
+    uint base_g;
+    uint base_m;
+    uint numel;
+    float lr;
+    float momentum;     // 动量系数
+    float dampening;
+    float weight_decay;
+    float nesterov;     // 0/1
+    float is_first;     // 0/1（首个动量步直接取 d）
+} pc;
+
+layout(std430, binding = 0) buffer P { float data_p[]; };        // 参数（读写）
+layout(std430, binding = 1) readonly buffer G { float data_g[]; };
+layout(std430, binding = 2) buffer M { float data_m[]; };        // 动量缓冲
+
+void main() {
+    // 网格可能被限制（小上限设备）：按 gl_NumWorkGroups 跨步循环覆盖全部元素
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint       i      = gl_GlobalInvocationID.x;
+    while (i < pc.numel) {
+        uint idx[4];
+        uint rem = i;
+        for (int d = 0; d < 4; ++d) {
+            idx[d] = rem % pc.ne[d];
+            rem /= pc.ne[d];
+        }
+        uint off_p = pc.base_p;
+        uint off_g = pc.base_g;
+        uint off_m = pc.base_m;
+        for (int d = 0; d < 4; ++d) {
+            off_p += idx[d] * pc.nb[d];
+            off_g += idx[d] * pc.nb[d];
+            off_m += idx[d] * pc.nb[d];
+        }
+        const float p = data_p[off_p];
+        float       d = data_g[off_g] + pc.weight_decay * p;
+        if (pc.momentum != 0.0) {
+            if (pc.is_first != 0.0) {
+                data_m[off_m] = d;
+            } else {
+                data_m[off_m] = pc.momentum * data_m[off_m] + (1.0 - pc.dampening) * d;
+            }
+            d = pc.nesterov != 0.0 ? d + pc.momentum * data_m[off_m] : data_m[off_m];
+        }
+        data_p[off_p] = p - pc.lr * d;
+
+        if (pc.numel - i <= stride) {
+            break;  // 无更多跨步元素（避免 uint 回绕）
+        }
+        i += stride;
+    }
+}

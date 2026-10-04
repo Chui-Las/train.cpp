@@ -885,6 +885,129 @@ void dispatch_acc(VulkanGraphContext& gc, Tensor* node) {
                     limit_groups(group_count(pc.numel)));
 }
 
+// ---------------------------------------------------------------- 设备端优化器步（M4.1）
+
+void dispatch_opt_step_adamw(VulkanGraphContext& gc, Tensor* node) {
+    const Tensor* grad = node->src[1];
+    const Tensor* m    = node->src[2];
+    const Tensor* v    = node->src[3];
+
+    float ps[6];
+    std::memcpy(ps, node->op_params, sizeof(ps));
+
+    VulkanOptStepAdamwPC pc{};
+    fill_ne(pc.ne, node);
+    fill_nb(pc.nb, node);
+    pc.numel    = count_u32(node);
+    pc.step_sz    = ps[0];
+    pc.bc2_sqrt   = ps[1];
+    pc.decay      = ps[2];
+    pc.beta1      = ps[3];
+    pc.beta2      = ps[4];
+    pc.eps        = ps[5];
+
+    // binding 0 = node（param 的完整视图，就地读写）；1=grad；2=m；3=v
+    const VulkanTensorBinding binds[4] = { vulkan_bind_tensor(node), vulkan_bind_tensor(grad),
+                                           vulkan_bind_tensor(m), vulkan_bind_tensor(v) };
+    pc.base_p = binds[0].base_elem;
+    pc.base_g = binds[1].base_elem;
+    pc.base_m = binds[2].base_elem;
+    pc.base_v = binds[3].base_elem;
+
+    vulkan_dispatch(gc, vulkan_pipeline("opt_step_adamw", sizeof(VulkanOptStepAdamwPC)), &pc,
+                    sizeof(pc), binds, 4, limit_groups(group_count(pc.numel)));
+}
+
+void dispatch_opt_step_sgd(VulkanGraphContext& gc, Tensor* node) {
+    const Tensor* grad = node->src[1];
+    const Tensor* mom  = node->src[2];
+
+    float ps[6];
+    std::memcpy(ps, node->op_params, sizeof(ps));
+
+    VulkanOptStepSgdPC pc{};
+    fill_ne(pc.ne, node);
+    fill_nb(pc.nb, node);
+    pc.numel        = count_u32(node);
+    pc.lr           = ps[0];
+    pc.momentum     = ps[1];
+    pc.dampening    = ps[2];
+    pc.weight_decay = ps[3];
+    pc.nesterov     = ps[4];
+    pc.is_first     = ps[5];
+
+    const VulkanTensorBinding binds[3] = { vulkan_bind_tensor(node), vulkan_bind_tensor(grad),
+                                           vulkan_bind_tensor(mom) };
+    pc.base_p = binds[0].base_elem;
+    pc.base_g = binds[1].base_elem;
+    pc.base_m = binds[2].base_elem;
+
+    vulkan_dispatch(gc, vulkan_pipeline("opt_step_sgd", sizeof(VulkanOptStepSgdPC)), &pc,
+                    sizeof(pc), binds, 3, limit_groups(group_count(pc.numel)));
+}
+
+// ---------------------------------------------------------------- 梯度裁剪原语 / WeightNorm 同步（M4.5）
+
+void dispatch_sum_sqr_acc(VulkanGraphContext& gc, Tensor* node) {
+    const Tensor* a = node->src[1];  // node 是 acc 的完整视图（src[0]）
+
+    VulkanSumSqrAccPC pc{};
+    pc.numel = count_u32(a);
+
+    const VulkanTensorBinding binds[2] = { vulkan_bind_tensor(a), vulkan_bind_tensor(node) };
+    pc.base_a   = binds[0].base_elem;
+    pc.base_acc = binds[1].base_elem;
+
+    // 单 workgroup（全元素归约后累加进 acc）
+    vulkan_dispatch(gc, vulkan_pipeline("sum_sqr_acc", sizeof(VulkanSumSqrAccPC)), &pc, sizeof(pc),
+                    binds, 2, 1);
+}
+
+void dispatch_clip_scale_inplace(VulkanGraphContext& gc, Tensor* node) {
+    const Tensor* norm = node->src[1];
+
+    float ps[2];
+    std::memcpy(ps, node->op_params, sizeof(ps));
+
+    VulkanClipScalePC pc{};
+    pc.numel    = count_u32(node);
+    pc.max_norm = ps[0];
+    pc.eps      = ps[1];
+
+    // binding 0 = node（a 的完整视图，就地读写）；1 = norm（1 元素）
+    const VulkanTensorBinding binds[2] = { vulkan_bind_tensor(node), vulkan_bind_tensor(norm) };
+    pc.base_a    = binds[0].base_elem;
+    pc.base_norm = binds[1].base_elem;
+
+    vulkan_dispatch(gc, vulkan_pipeline("clip_scale_inplace", sizeof(VulkanClipScalePC)), &pc,
+                    sizeof(pc), binds, 2, limit_groups(group_count(pc.numel)));
+}
+
+void dispatch_weightnorm_sync(VulkanGraphContext& gc, Tensor* node) {
+    const Tensor* v = node->src[0];  // node 是 g 的完整视图（src[1]）
+
+    const int nd = tensor_n_dims(v);
+    const int64_t oc = v->ne[nd - 1];
+    int64_t       n_rest = 1;
+    for (int d = 0; d + 1 < nd; ++d) {
+        n_rest *= v->ne[d];
+    }
+    TRC_ASSERT(oc > 0 && oc <= (int64_t) UINT32_MAX, "Vulkan weightnorm_sync：oc 越界（%s）", v->name);
+    TRC_ASSERT(n_rest > 0 && n_rest <= (int64_t) UINT32_MAX, "Vulkan weightnorm_sync：n_rest 越界（%s）",
+               v->name);
+
+    VulkanWeightNormSyncPC pc{};
+    pc.numel  = (uint32_t) oc;
+    pc.n_rest = (uint32_t) n_rest;
+
+    const VulkanTensorBinding binds[2] = { vulkan_bind_tensor(v), vulkan_bind_tensor(node) };
+    pc.base_v = binds[0].base_elem;
+    pc.base_g = binds[1].base_elem;
+
+    vulkan_dispatch(gc, vulkan_pipeline("weightnorm_sync", sizeof(VulkanWeightNormSyncPC)), &pc,
+                    sizeof(pc), binds, 2, limit_groups(group_count(pc.numel)));
+}
+
 // ---------------------------------------------------------------- 索引
 
 bool is_i32(const Tensor* t) { return t != nullptr && t->type == TYPE_I32; }
@@ -1121,6 +1244,27 @@ bool vulkan_supports_op(const Tensor* t) {
                    a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float);
         }
 
+        // 设备端优化器步：F32 且 param/grad/状态/结果均连续（同上主机实现要求）
+        case OP_OPT_STEP_ADAMW:
+            return srcs_f32(t, 4) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]) && tensor_is_contiguous(t->src[2]) &&
+                   tensor_is_contiguous(t->src[3]) && tensor_is_contiguous(t);
+        case OP_OPT_STEP_SGD:
+            return srcs_f32(t, 3) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]) && tensor_is_contiguous(t->src[2]) &&
+                   tensor_is_contiguous(t);
+
+        // M4.5：梯度裁剪原语 / WeightNorm 同步（F32，连续）
+        case OP_SUM_SQR_ACC:
+            return srcs_f32(t, 2) && tensor_nelements(t->src[0]) == 1 &&
+                   tensor_is_contiguous(t->src[1]);
+        case OP_CLIP_SCALE_INPLACE:
+            return srcs_f32(t, 2) && tensor_nelements(t->src[1]) == 1 &&
+                   tensor_is_contiguous(t->src[0]);
+        case OP_WEIGHTNORM_SYNC:
+            return srcs_f32(t, 2) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]);
+
         default:
             // 其余算子随 M1.4c/M1.4d 逐个补齐；未支持时由调度器回退
             return false;
@@ -1230,6 +1374,15 @@ bool vulkan_compute_node(VulkanGraphContext& gc, Tensor* node) {
         case OP_ACC:
             dispatch_acc(gc, node);
             return true;
+
+        // 设备端优化器步
+        case OP_OPT_STEP_ADAMW: dispatch_opt_step_adamw(gc, node); return true;
+        case OP_OPT_STEP_SGD:   dispatch_opt_step_sgd(gc, node); return true;
+
+        // 设备端梯度裁剪原语 / WeightNorm 同步（M4.5）
+        case OP_SUM_SQR_ACC:        dispatch_sum_sqr_acc(gc, node); return true;
+        case OP_CLIP_SCALE_INPLACE: dispatch_clip_scale_inplace(gc, node); return true;
+        case OP_WEIGHTNORM_SYNC:    dispatch_weightnorm_sync(gc, node); return true;
 
         // 索引
         case OP_GET_ROWS:      dispatch_get_rows(gc, node); return true;
