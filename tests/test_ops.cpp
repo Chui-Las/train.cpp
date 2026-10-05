@@ -1789,3 +1789,164 @@ TRC_TEST(cpu_conv_transpose_2d_stride2) {
         TRC_EXPECT_NEAR(out[i], 1.0f, 1e-6);
     }
 }
+
+// ---------------- 设备端优化器步（M4.1）----------------
+
+// AdamW 单步（首步）：参数/m/v 与手算一致
+TRC_TEST(cpu_opt_step_adamw) {
+    Fixture f;
+    Tensor* p = new_tensor_1d(f.ctx, TYPE_F32, 4);
+    Tensor* g = new_tensor_1d(f.ctx, TYPE_F32, 4);
+    Tensor* m = new_tensor_1d(f.ctx, TYPE_F32, 4);
+    Tensor* v = new_tensor_1d(f.ctx, TYPE_F32, 4);
+
+    const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, lr = 0.01f, wd = 0.0f;
+    const double bc1 = 1.0 - std::pow((double) beta1, 1.0);
+    const double bc2 = 1.0 - std::pow((double) beta2, 1.0);
+    Tensor*      node = opt_step_adamw(f.ctx, p, g, m, v, (float) ((double) lr / bc1),
+                                       (float) std::sqrt(bc2), 1.0f - lr * wd, beta1, beta2, eps);
+    f.alloc();
+
+    const float vp[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float vg[4] = {0.1f, -0.2f, 0.3f, -0.4f};
+    const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    tensor_set(p, vp, 0, sizeof(vp));
+    tensor_set(g, vg, 0, sizeof(vg));
+    tensor_set(m, zeros, 0, sizeof(zeros));
+    tensor_set(v, zeros, 0, sizeof(zeros));
+
+    f.compute(node);
+
+    float out[4] = {0}, mo[4] = {0}, vo[4] = {0};
+    tensor_get(p, out, 0, sizeof(out));
+    tensor_get(m, mo, 0, sizeof(mo));
+    tensor_get(v, vo, 0, sizeof(vo));
+    for (int i = 0; i < 4; ++i) {
+        const double gi   = vg[i];
+        const double mexp = (gi - 0.0) * (1.0 - beta1);
+        const double vexp = 0.0 * beta2 + gi * gi * (1.0 - beta2);
+        const double denom = std::sqrt(vexp) / std::sqrt(bc2) + eps;
+        const double pexp  = vp[i] * (1.0 - lr * wd) - ((double) lr / bc1) * (mexp / denom);
+        TRC_EXPECT_NEAR(mo[i], mexp, 1e-6);
+        TRC_EXPECT_NEAR(vo[i], vexp, 1e-6);
+        TRC_EXPECT_NEAR(out[i], pexp, 1e-6);
+    }
+}
+
+// SGD 单步（首步，动量 + Nesterov + 权重衰减）：与手算一致
+TRC_TEST(cpu_opt_step_sgd_momentum) {
+    Fixture f;
+    Tensor* p = new_tensor_1d(f.ctx, TYPE_F32, 4);
+    Tensor* g = new_tensor_1d(f.ctx, TYPE_F32, 4);
+    Tensor* m = new_tensor_1d(f.ctx, TYPE_F32, 4);
+
+    const float lr = 0.1f, mom = 0.9f, damp = 0.0f, wd = 0.5f;
+    Tensor*     node = opt_step_sgd(f.ctx, p, g, m, lr, mom, damp, wd, true /*nesterov*/,
+                                    true /*is_first*/);
+    f.alloc();
+
+    const float vp[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float vg[4] = {0.1f, -0.2f, 0.3f, -0.4f};
+    const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    tensor_set(p, vp, 0, sizeof(vp));
+    tensor_set(g, vg, 0, sizeof(vg));
+    tensor_set(m, zeros, 0, sizeof(zeros));
+
+    f.compute(node);
+
+    float out[4] = {0}, mo[4] = {0};
+    tensor_get(p, out, 0, sizeof(out));
+    tensor_get(m, mo, 0, sizeof(mo));
+    for (int i = 0; i < 4; ++i) {
+        const double d    = vg[i] + wd * vp[i];
+        const double mexp = d;                        // 首步直接取 d
+        const double dex  = d + mom * mexp;           // Nesterov
+        const double pexp = vp[i] - lr * dex;
+        TRC_EXPECT_NEAR(mo[i], mexp, 1e-6);
+        TRC_EXPECT_NEAR(out[i], pexp, 1e-6);
+    }
+}
+
+// M4.5：梯度平方和累积（sum_sqr_acc）——acc[0] += Σ a²，跨多个张量顺序累积
+TRC_TEST(cpu_sum_sqr_acc) {
+    Fixture f;
+    Tensor* acc = new_tensor_1d(f.ctx, TYPE_F32, 1);
+    Tensor* a1  = new_tensor_1d(f.ctx, TYPE_F32, 3);
+    Tensor* a2  = new_tensor_1d(f.ctx, TYPE_F32, 2);
+    Tensor* n1  = sum_sqr_acc(f.ctx, acc, a1);
+    Tensor* n2  = sum_sqr_acc(f.ctx, acc, a2);
+    f.alloc();
+
+    const float init  = 1.0f;                      // 累积初值
+    const float v1[3] = {1.0f, 2.0f, 3.0f};        // Σ = 14
+    const float v2[2] = {4.0f, 5.0f};              // Σ = 41
+    tensor_set(acc, &init, 0, sizeof(init));
+    tensor_set(a1, v1, 0, sizeof(v1));
+    tensor_set(a2, v2, 0, sizeof(v2));
+
+    f.graph->nodes.push_back(n1);
+    f.graph->nodes.push_back(n2);
+    f.dev->graph_compute(f.graph);
+
+    float got = 0.0f;
+    tensor_get(acc, &got, 0, sizeof(got));
+    TRC_EXPECT_NEAR(got, 1.0f + 14.0f + 41.0f, 1e-5);
+}
+
+// M4.5：梯度就地裁剪缩放（clip_scale_inplace）：超门限缩放、未超门限不变
+TRC_TEST(cpu_clip_scale_inplace) {
+    const float va[2] = {3.0f, 4.0f};
+
+    {
+        Fixture f;
+        Tensor* a    = new_tensor_1d(f.ctx, TYPE_F32, 2);
+        Tensor* norm = new_tensor_1d(f.ctx, TYPE_F32, 1);
+        Tensor* node = clip_scale_inplace(f.ctx, a, norm, 1.0f, 1e-6f);
+        f.alloc();
+        const float vnorm = 25.0f;  // total = 5 > max_norm = 1
+        tensor_set(a, va, 0, sizeof(va));
+        tensor_set(norm, &vnorm, 0, sizeof(vnorm));
+        f.compute(node);
+
+        float got[2] = {0};
+        tensor_get(a, got, 0, sizeof(got));
+        const float scale = 1.0f / (5.0f + 1e-6f);
+        TRC_EXPECT_NEAR(got[0], 3.0f * scale, 1e-6);
+        TRC_EXPECT_NEAR(got[1], 4.0f * scale, 1e-6);
+    }
+    {
+        Fixture f;
+        Tensor* a    = new_tensor_1d(f.ctx, TYPE_F32, 2);
+        Tensor* norm = new_tensor_1d(f.ctx, TYPE_F32, 1);
+        Tensor* node = clip_scale_inplace(f.ctx, a, norm, 10.0f, 1e-6f);
+        f.alloc();
+        const float vnorm = 25.0f;  // total = 5 <= max_norm = 10 → scale clamp 到 1
+        tensor_set(a, va, 0, sizeof(va));
+        tensor_set(norm, &vnorm, 0, sizeof(vnorm));
+        f.compute(node);
+
+        float got[2] = {0};
+        tensor_get(a, got, 0, sizeof(got));
+        TRC_EXPECT_NEAR(got[0], 3.0f, 1e-6);
+        TRC_EXPECT_NEAR(got[1], 4.0f, 1e-6);
+    }
+}
+
+// M4.5：WeightNorm 同步（weightnorm_sync）——g[oc] = sqrt(Σ_rest v²)
+TRC_TEST(cpu_weightnorm_sync) {
+    Fixture f;
+    Tensor* v    = new_tensor_2d(f.ctx, TYPE_F32, 2, 3);  // [n_rest=2, oc=3]
+    Tensor* g    = new_tensor_2d(f.ctx, TYPE_F32, 1, 3);
+    Tensor* node = weightnorm_sync(f.ctx, v, g);
+    f.alloc();
+
+    const float vv[6] = {3.0f, 4.0f, 0.0f, 5.0f, 1.0f, 2.0f};
+    tensor_set(v, vv, 0, sizeof(vv));
+    f.compute(node);
+
+    float got[3] = {0};
+    tensor_get(g, got, 0, sizeof(got));
+    TRC_EXPECT_NEAR(got[0], 5.0f, 1e-6);          // sqrt(9+16)
+    TRC_EXPECT_NEAR(got[1], 5.0f, 1e-6);          // sqrt(0+25)
+    TRC_EXPECT_NEAR(got[2], std::sqrt(5.0f), 1e-6);  // sqrt(1+4)
+}

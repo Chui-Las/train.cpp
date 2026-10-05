@@ -643,29 +643,25 @@ void backward_op(Graph* graph, Tensor* tensor, const std::unordered_set<Tensor*>
         } break;
 
         // ---------------- 1.3b 及以后 ----------------
+        // 设备端优化器步（M4.1）：非可微副作用算子（就地更新参数），不参与反向传播
+        case OP_OPT_STEP_ADAMW:
+        case OP_OPT_STEP_SGD:
+        // 设备端梯度裁剪 / WeightNorm 同步（M4.5）：同为不可微副作用算子
+        case OP_SUM_SQR_ACC:
+        case OP_CLIP_SCALE_INPLACE:
+        case OP_WEIGHTNORM_SYNC:
+            break;
+
         case OP_COL2IM:
         case OP_PAD_BACK:  // 仅作为反向结果使用，不参与二次反向
         case OP_POOL_2D_BACK:  // 仅作为 pool_2d 反向结果使用，不参与二次反向
         case OP_OUT_PROD:
         case OP_CROSS_ENTROPY_LOSS_BACK:  // 仅作为反向结果使用，不参与二次反向
-        case OP_OPT_STEP_ADAMW:
-        case OP_OPT_STEP_SGD:
         case OP_CPY:
         case OP_SET_ROWS:
         default:
             TRC_ABORT("算子 %s 的反向尚未实现", op_name(tensor->op));
     }
-}
-
-// 用同一个 float 填充 F32 连续张量
-// R13：直接写 t->data（CPU/Vulkan 缓冲都是主机指针，M1.4 语义），不再分配全尺寸临时 vector
-void tensor_fill_f32(Tensor* t, float value) {
-    TRC_ASSERT(t->type == TYPE_F32, "tensor_fill_f32: 仅支持 f32");
-    TRC_ASSERT(tensor_is_contiguous(t), "tensor_fill_f32: 张量必须连续");
-    TRC_ASSERT(t->data != nullptr, "tensor_fill_f32: 张量 %s 无数据（尚未分配？）", t->name);
-    const size_t n = (size_t) tensor_nelements(t);
-    float*       p = (float*) t->data;
-    std::fill(p, p + n, value);
 }
 
 } // namespace
@@ -746,7 +742,8 @@ void graph_build_backward_expand(Graph* graph) {
         }
         if (node->backward_graph != nullptr && node->backward_graph != graph) {
             TRC_ABORT("检测到多图共享张量 %s（op=%s）：禁止多图共享参数/梯度路径中间量"
-                      "（梯度会静默串扰）；双图训练请使用冻结/解冻 + detach 输入",
+                      "（梯度会静默串扰，R4）；双图训练请使用冻结/解冻 + detach 输入"
+                      "（见 docs/开发进度-二期.md §5.1 R4）",
                       node->name[0] != '\0' ? node->name : "<未命名>", op_name(node->op));
         }
         node->backward_graph = graph;
@@ -785,22 +782,33 @@ Tensor* graph_get_grad_acc(const Graph* graph, const Tensor* t) {
 
 void graph_reset(Graph* graph) {
     TRC_ASSERT(graph != nullptr, "graph_reset: graph 为空");
+    // M4.2：设备张量的梯度清零走设备 fill（单次提交），不再主机逐元素扫描
+    std::vector<TensorFill> fills;
+    fills.reserve(graph->nodes.size());
     for (Tensor* node : graph->nodes) {
         if (node->grad_acc == nullptr) {
             continue;
         }
         // 损失的初始梯度为 1，其余为 0（与 ggml_graph_reset 一致）
-        tensor_fill_f32(node->grad_acc, has_flag(node, TENSOR_FLAG_LOSS) ? 1.0f : 0.0f);
+        fills.push_back({node->grad_acc, has_flag(node, TENSOR_FLAG_LOSS) ? 1.0f : 0.0f});
+    }
+    if (!fills.empty()) {
+        tensor_fill_values(fills.data(), fills.size());
     }
 }
 
 void graph_reset_accumulate(Graph* graph) {
     TRC_ASSERT(graph != nullptr, "graph_reset_accumulate: graph 为空");
+    std::vector<TensorFill> fills;
+    fills.reserve(graph->nodes.size());
     for (Tensor* node : graph->nodes) {
         if (node->grad_acc != nullptr && has_flag(node, TENSOR_FLAG_LOSS)) {
             // 只播种损失的初始梯度，保留已累积的参数梯度（micro-batch 累积）
-            tensor_fill_f32(node->grad_acc, 1.0f);
+            fills.push_back({node->grad_acc, 1.0f});
         }
+    }
+    if (!fills.empty()) {
+        tensor_fill_values(fills.data(), fills.size());
     }
 }
 

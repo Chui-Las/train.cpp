@@ -1077,3 +1077,116 @@ TRC_TEST(conformance_pad_zero_fill) {
     TRC_EXPECT_NEAR(max_abs, 0.0, 1e-6);
     std::printf("    [ OK ] %-24s max_abs=%.3g\n", "pad_zero_fill", max_abs);
 }
+
+// 设备端优化器步（M4.1）：CPU vs Vulkan 就地更新结果对照
+TRC_TEST(conformance_opt_step) {
+    Device* dev = find_vulkan_device();
+    if (dev == nullptr) {
+        std::printf("    跳过：未检测到 Vulkan 设备（或未启用 TRC_VULKAN）\n");
+        return;
+    }
+    Device* cpu = device_cpu();
+    TRC_EXPECT(cpu != nullptr);
+
+    compare(cpu, dev, "opt_step_adamw", [](Context* ctx, Graph*) {
+        Tensor* p   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* g   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* m   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* v   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* out = opt_step_adamw(ctx, p, g, m, v, 0.05f, 0.0316227766f, 0.999f, 0.9f, 0.999f,
+                                     1e-8f);
+        return BuiltGraph{out, {{p, ramp(16)}, {g, ramp(16)}, {m, ramp(16)}, {v, ramp_pos(16)}}};
+    });
+
+    compare(cpu, dev, "opt_step_sgd", [](Context* ctx, Graph*) {
+        Tensor* p   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* g   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* m   = new_tensor_1d(ctx, TYPE_F32, 16);
+        Tensor* out = opt_step_sgd(ctx, p, g, m, 0.1f, 0.9f, 0.1f, 0.01f, true, false);
+        return BuiltGraph{out, {{p, ramp(16)}, {g, ramp(16)}, {m, ramp(16)}}};
+    });
+}
+
+// 设备端梯度裁剪原语 / WeightNorm 同步（M4.5）：CPU vs Vulkan
+TRC_TEST(conformance_clip_and_weightnorm) {
+    Device* dev = find_vulkan_device();
+    if (dev == nullptr) {
+        std::printf("    （本机未检测到 Vulkan 设备，跳过）\n");
+        return;
+    }
+    Device* cpu = device_cpu();
+    TRC_EXPECT(cpu != nullptr);
+
+    compare(cpu, dev, "sum_sqr_acc", [](Context* ctx, Graph*) {
+        Tensor* acc = new_tensor_1d(ctx, TYPE_F32, 1);
+        Tensor* a   = new_tensor_1d(ctx, TYPE_F32, 512);
+        Tensor* out = sum_sqr_acc(ctx, acc, a);
+        return BuiltGraph{out, {{acc, std::vector<float>{2.0f}}, {a, ramp(512)}}};
+    });
+
+    compare(cpu, dev, "clip_scale_inplace", [](Context* ctx, Graph*) {
+        Tensor* a    = new_tensor_1d(ctx, TYPE_F32, 512);
+        Tensor* norm = new_tensor_1d(ctx, TYPE_F32, 1);
+        Tensor* out  = clip_scale_inplace(ctx, a, norm, 1.0f, 1e-6f);
+        return BuiltGraph{out, {{a, ramp(512)}, {norm, std::vector<float>{1000.0f}}}};
+    });
+
+    compare(cpu, dev, "weightnorm_sync", [](Context* ctx, Graph*) {
+        Tensor* v   = new_tensor_2d(ctx, TYPE_F32, 7, 4);  // [n_rest=7, oc=4]
+        Tensor* g   = new_tensor_2d(ctx, TYPE_F32, 1, 4);
+        Tensor* out = weightnorm_sync(ctx, v, g);
+        return BuiltGraph{out, {{v, ramp(28)}}};
+    });
+}
+
+// 设备端批量填充（M4.2）：CPU（主机直填）vs Vulkan（vkCmdFillBuffer）结果对照；
+// 同时验证不同取值（含负值/非整数）与多张量一次提交。
+TRC_TEST(conformance_fill_tensors) {
+    Device* dev = find_vulkan_device();
+    if (dev == nullptr) {
+        std::printf("    跳过：未检测到 Vulkan 设备（或未启用 TRC_VULKAN）\n");
+        return;
+    }
+    Device* cpu = device_cpu();
+    TRC_EXPECT(cpu != nullptr);
+
+    const float values[] = {0.0f, 1.0f, 1.5f, -2.25f};
+    const int64_t sizes[] = {1, 37, 256, 4096};
+
+    auto run = [&](Device* d) {
+        std::vector<Tensor*>    ts;
+        std::vector<TensorFill> fills;
+        Context* ctx = context_new(1 << 24);
+        for (int64_t n : sizes) {
+            Tensor* t = new_tensor_1d(ctx, TYPE_F32, n);
+            ts.push_back(t);
+        }
+        Buffer* buf = buffer_alloc_ctx_tensors(ctx, d->default_buffer_type());
+        TRC_EXPECT(buf != nullptr);
+        for (size_t i = 0; i < ts.size(); ++i) {
+            fills.push_back({ts[i], values[i]});
+        }
+        d->fill_tensors(fills.data(), fills.size());
+        std::vector<std::vector<float>> got(ts.size());
+        for (size_t i = 0; i < ts.size(); ++i) {
+            got[i].resize((size_t) sizes[i]);
+            tensor_get(ts[i], got[i].data(), 0, got[i].size() * sizeof(float));
+        }
+        buffer_free(buf);
+        context_free(ctx);
+        return got;
+    };
+
+    const std::vector<std::vector<float>> a = run(cpu);
+    const std::vector<std::vector<float>> b = run(dev);
+    int64_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        for (size_t j = 0; j < a[i].size(); ++j) {
+            if (a[i][j] != values[i] || b[i][j] != values[i]) {
+                ++bad;
+            }
+        }
+    }
+    TRC_EXPECT_EQ(bad, 0);
+    std::printf("    [ OK ] %-24s 4 张量/值全部一致\n", "fill_tensors");
+}

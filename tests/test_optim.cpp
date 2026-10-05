@@ -373,7 +373,8 @@ TRC_TEST(optim_sgd_hand_computed) {
     // d = g + wd·p = 2 + 0.5 = 2.5；p = 1 - 0.1·2.5 = 0.75
     TRC_EXPECT_NEAR(read_scalar(p), 0.75, 1e-6);
     TRC_EXPECT(optim_state_count(f.opt) == 1);
-    TRC_EXPECT(optim_state(f.opt, 0)->data != nullptr);
+    // M4.5：不可映射 device-local（强制 staging）下 data 可为空，以 buffer 为准
+    TRC_EXPECT(optim_state(f.opt, 0)->data != nullptr || optim_state(f.opt, 0)->buffer != nullptr);
 }
 
 TRC_TEST(optim_adamw_hand_computed) {
@@ -470,7 +471,8 @@ TRC_TEST(optim_states_allocated_by_ctx_alloc) {
 
     Tensor* st = optim_state(f.opt, 0);
     TRC_EXPECT(st->buffer != nullptr);  // 由 ctx buffer 统一分配
-    TRC_EXPECT(st->data != nullptr);
+    // M4.5：不可映射 device-local（强制 staging）下 data 可为空，以 buffer 为准
+    TRC_EXPECT(st->data != nullptr || st->buffer != nullptr);
 
     write_f32(p, {1.0f, 2.0f});
     write_f32(gp, {1.0f, 1.0f});
@@ -907,4 +909,169 @@ TRC_TEST(optim_add_group_after_step) {
     }
     TRC_EXPECT_NEAR(worst, 0.0, 1e-6);
     std::printf("    动态加组轨迹与独立参照一致（最大差 %.3g）\n", worst);
+}
+
+// ---------------------------------------------------------------- 设备端优化器步 vs 主机（M4.1）
+
+namespace {
+
+// 每步梯度（随时间/下标变化，非退化）
+std::vector<float> opt_step_grads(int t, int64_t n) {
+    std::vector<float> g((size_t) n);
+    for (int64_t i = 0; i < n; ++i) {
+        g[(size_t) i] = std::sin(0.3f * (float) t + 0.7f * (float) i) * 0.5f;
+    }
+    return g;
+}
+
+// 更新 opt_step 节点的 op_params 标量（float[6]）
+void set_op_scalars(Tensor* node, const float s[6]) {
+    std::memcpy(node->op_params, s, 6 * sizeof(float));
+}
+
+} // namespace
+
+// 设备 op（OP_OPT_STEP_ADAMW）与主机 AdamW 多步逐元素一致（参数 + m/v 状态）
+TRC_TEST(optim_device_step_vs_host_adamw) {
+    OptimFixture f;
+    if (!f.device_ok()) {
+        return;
+    }
+    constexpr int64_t N = 7;
+    constexpr int     STEPS = 25;
+
+    AdamwOptions o;
+    o.lr           = 0.02f;
+    o.beta1        = 0.9f;
+    o.beta2        = 0.999f;
+    o.eps          = 1e-8f;
+    o.weight_decay = 0.01f;
+
+    // 主机路径
+    Tensor* ph = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* gh = make_grad_tensor(f.ctx, ph);
+    ph->grad   = gh;
+    f.opt      = optim_adamw_new(f.ctx, &ph, 1, o);
+
+    // 设备 op 路径（独立参数与状态）
+    Tensor* pd   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* gd   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* md   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* vd   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* node = opt_step_adamw(f.ctx, pd, gd, md, vd, 0.0f, 1.0f, 1.0f, o.beta1, o.beta2, o.eps);
+
+    f.alloc();
+
+    std::vector<float> p0((size_t) N), z((size_t) N, 0.0f);
+    for (int64_t i = 0; i < N; ++i) {
+        p0[(size_t) i] = 0.5f * (float) i - 1.5f;
+    }
+    write_f32(ph, p0);
+    write_f32(pd, p0);
+    write_f32(optim_state(f.opt, 0), z);  // m_host
+    write_f32(optim_state(f.opt, 1), z);  // v_host
+    write_f32(md, z);
+    write_f32(vd, z);
+
+    Graph* gr = graph_new(f.ctx);
+    graph_build_forward_expand(f.ctx, gr, node);
+
+    double worst = 0.0;
+    for (int t = 1; t <= STEPS; ++t) {
+        const double bc1 = 1.0 - std::pow((double) o.beta1, (double) t);
+        const double bc2 = 1.0 - std::pow((double) o.beta2, (double) t);
+        const float  s[6] = {(float) ((double) o.lr / bc1), (float) std::sqrt(bc2),
+                             1.0f - o.lr * o.weight_decay, o.beta1, o.beta2, o.eps};
+        set_op_scalars(node, s);
+
+        const std::vector<float> g = opt_step_grads(t, N);
+        write_f32(gd, g);
+        write_f32(gh, g);
+
+        f.dev->graph_compute(gr);
+        optim_step(f.opt);
+
+        const std::vector<float> pdev  = read_f32(pd);
+        const std::vector<float> phost = read_f32(ph);
+        const std::vector<float> mdev  = read_f32(md);
+        const std::vector<float> mhost = read_f32(optim_state(f.opt, 0));
+        const std::vector<float> vdev  = read_f32(vd);
+        const std::vector<float> vhost = read_f32(optim_state(f.opt, 1));
+        for (int64_t i = 0; i < N; ++i) {
+            worst = std::max(worst, (double) std::fabs(pdev[(size_t) i] - phost[(size_t) i]));
+            worst = std::max(worst, (double) std::fabs(mdev[(size_t) i] - mhost[(size_t) i]));
+            worst = std::max(worst, (double) std::fabs(vdev[(size_t) i] - vhost[(size_t) i]));
+        }
+    }
+    graph_free(gr);
+    TRC_EXPECT_NEAR(worst, 0.0, 1e-6);
+    std::printf("    设备 opt_step AdamW 与主机 %d 步一致（最大差 %.3g）\n", STEPS, worst);
+}
+
+// 设备 op（OP_OPT_STEP_SGD）与主机 SGD（momentum/dampening/nesterov/wd）多步一致
+TRC_TEST(optim_device_step_vs_host_sgd) {
+    OptimFixture f;
+    if (!f.device_ok()) {
+        return;
+    }
+    constexpr int64_t N = 7;
+    constexpr int     STEPS = 25;
+
+    SgdOptions o;
+    o.lr           = 0.05f;
+    o.momentum     = 0.9f;
+    o.dampening    = 0.1f;
+    o.weight_decay = 0.02f;
+    o.nesterov     = true;
+
+    Tensor* ph = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* gh = make_grad_tensor(f.ctx, ph);
+    ph->grad   = gh;
+    f.opt      = optim_sgd_new(f.ctx, &ph, 1, o);
+
+    Tensor* pd   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* gd   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* md   = new_tensor_1d(f.ctx, TYPE_F32, N);
+    Tensor* node = opt_step_sgd(f.ctx, pd, gd, md, 0.0f, 1.0f, 1.0f, 0.0f, false, true);
+
+    f.alloc();
+
+    std::vector<float> p0((size_t) N), z((size_t) N, 0.0f);
+    for (int64_t i = 0; i < N; ++i) {
+        p0[(size_t) i] = 0.4f * (float) i - 1.2f;
+    }
+    write_f32(ph, p0);
+    write_f32(pd, p0);
+    write_f32(optim_state(f.opt, 0), z);  // momentum_host
+    write_f32(md, z);
+
+    Graph* gr = graph_new(f.ctx);
+    graph_build_forward_expand(f.ctx, gr, node);
+
+    double worst = 0.0;
+    for (int t = 1; t <= STEPS; ++t) {
+        // 主机 SGD：update 时 st.step==t-1，首步（t==1）直接取 d
+        const float s[6] = {o.lr, o.momentum, o.dampening, o.weight_decay, o.nesterov ? 1.0f : 0.0f,
+                            t == 1 ? 1.0f : 0.0f};
+        set_op_scalars(node, s);
+
+        const std::vector<float> g = opt_step_grads(t, N);
+        write_f32(gd, g);
+        write_f32(gh, g);
+
+        f.dev->graph_compute(gr);
+        optim_step(f.opt);
+
+        const std::vector<float> pdev  = read_f32(pd);
+        const std::vector<float> phost = read_f32(ph);
+        const std::vector<float> mdev  = read_f32(md);
+        const std::vector<float> mhost = read_f32(optim_state(f.opt, 0));
+        for (int64_t i = 0; i < N; ++i) {
+            worst = std::max(worst, (double) std::fabs(pdev[(size_t) i] - phost[(size_t) i]));
+            worst = std::max(worst, (double) std::fabs(mdev[(size_t) i] - mhost[(size_t) i]));
+        }
+    }
+    graph_free(gr);
+    TRC_EXPECT_NEAR(worst, 0.0, 1e-6);
+    std::printf("    设备 opt_step SGD 与主机 %d 步一致（最大差 %.3g）\n", STEPS, worst);
 }

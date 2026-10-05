@@ -1495,6 +1495,145 @@ void compute_conv_transpose_2d(Tensor* dst) {
     }
 }
 
+// ---------------------------------------------------------------- 设备端优化器步（M4.1）
+
+// op_params float[6] 读取（与 trc_ops.cpp 的构造一致）
+void read_op_params_f32(const Tensor* t, float* out6) {
+    std::memcpy(out6, t->op_params, 6 * sizeof(float));
+}
+
+// node 是 param 的完整视图（node->data == param->data）；逐元素运算顺序与主机优化器一致
+void compute_opt_step_adamw(Tensor* node) {
+    const Tensor* param = node->src[0];
+    const Tensor* grad  = node->src[1];
+    const Tensor* m     = node->src[2];
+    const Tensor* v     = node->src[3];
+    TRC_ASSERT(node->type == TYPE_F32 && param->type == TYPE_F32 && grad->type == TYPE_F32 &&
+                   m->type == TYPE_F32 && v->type == TYPE_F32,
+               "CPU opt_step_adamw 仅支持 F32");
+
+    float ps[6];
+    read_op_params_f32(node, ps);
+    const float step_sz  = ps[0];
+    const float bc2_sqrt = ps[1];
+    const float decay    = ps[2];
+    const float beta1    = ps[3];
+    const float beta2    = ps[4];
+    const float eps      = ps[5];
+
+    const int64_t n = tensor_nelements(param);
+    float*        p = (float*) node->data;
+    const float*  g = (const float*) grad->data;
+    float*        mm = (float*) m->data;
+    float*        vv = (float*) v->data;
+    for (int64_t i = 0; i < n; ++i) {
+        const float gi = g[i];
+        mm[i] += (gi - mm[i]) * (1.0f - beta1);
+        vv[i] = vv[i] * beta2 + gi * gi * (1.0f - beta2);
+
+        const float pv    = p[i] * decay;
+        const float denom = std::sqrt(vv[i]) / bc2_sqrt + eps;
+        p[i]              = pv - step_sz * (mm[i] / denom);
+    }
+}
+
+void compute_opt_step_sgd(Tensor* node) {
+    const Tensor* param = node->src[0];
+    const Tensor* grad  = node->src[1];
+    const Tensor* mom   = node->src[2];
+    TRC_ASSERT(node->type == TYPE_F32 && param->type == TYPE_F32 && grad->type == TYPE_F32 &&
+                   mom->type == TYPE_F32,
+               "CPU opt_step_sgd 仅支持 F32");
+
+    float ps[6];
+    read_op_params_f32(node, ps);
+    const float lr            = ps[0];
+    const float momentum_coef = ps[1];
+    const float dampening     = ps[2];
+    const float weight_decay  = ps[3];
+    const float nesterov      = ps[4];
+    const float is_first      = ps[5];
+
+    const int64_t n = tensor_nelements(param);
+    float*        p = (float*) node->data;
+    const float*  g = (const float*) grad->data;
+    float*        mm = (float*) mom->data;
+    for (int64_t i = 0; i < n; ++i) {
+        float d = g[i] + weight_decay * p[i];
+        if (momentum_coef != 0.0f) {
+            if (is_first != 0.0f) {
+                mm[i] = d;
+            } else {
+                mm[i] = momentum_coef * mm[i] + (1.0f - dampening) * d;
+            }
+            d = nesterov != 0.0f ? d + momentum_coef * mm[i] : mm[i];
+        }
+        p[i] -= lr * d;
+    }
+}
+
+// M4.5：设备端梯度裁剪原语 / WeightNorm 同步（CPU 参考实现）
+
+// acc[0] += Σ a²（node 是 acc 的完整视图）；与主机 clip 的 double 累加一致
+void compute_sum_sqr_acc(Tensor* node) {
+    const Tensor* acc = node->src[0];
+    const Tensor* a   = node->src[1];
+    TRC_ASSERT(node->type == TYPE_F32 && acc->type == TYPE_F32 && a->type == TYPE_F32,
+               "CPU sum_sqr_acc 仅支持 F32");
+    const int64_t n = tensor_nelements(a);
+    const float*  x = (const float*) a->data;
+    double        s = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        s += (double) x[i] * (double) x[i];
+    }
+    float* dst = (float*) node->data;  // == acc->data
+    dst[0]     = dst[0] + (float) s;
+}
+
+// a *= min(1, max_norm / (sqrt(norm[0]) + eps))；与主机 optim_clip_grad_norm 的缩放一致
+void compute_clip_scale_inplace(Tensor* node) {
+    const Tensor* a    = node->src[0];
+    const Tensor* norm = node->src[1];
+    TRC_ASSERT(node->type == TYPE_F32 && a->type == TYPE_F32 && norm->type == TYPE_F32,
+               "CPU clip_scale_inplace 仅支持 F32");
+    float params[2];
+    std::memcpy(params, node->op_params, sizeof(params));
+    const float total = std::sqrt(*(const float*) norm->data);
+    float       scale = params[0] / (total + params[1]);
+    if (scale > 1.0f) {
+        scale = 1.0f;
+    }
+    const int64_t n = tensor_nelements(a);
+    float*        p = (float*) node->data;  // == a->data
+    for (int64_t i = 0; i < n; ++i) {
+        p[i] *= scale;
+    }
+}
+
+// g[oc] = sqrt(Σ_rest v²)（逐输出通道；v 连续，oc 为最后一维）
+void compute_weightnorm_sync(Tensor* node) {
+    const Tensor* v = node->src[0];
+    Tensor*       g = node->src[1];
+    TRC_ASSERT(node->type == TYPE_F32 && v->type == TYPE_F32 && g->type == TYPE_F32,
+               "CPU weightnorm_sync 仅支持 F32");
+    const int     nd    = tensor_n_dims(v);
+    const int64_t oc    = v->ne[nd - 1];
+    int64_t       n_rest = 1;
+    for (int d = 0; d + 1 < nd; ++d) {
+        n_rest *= v->ne[d];
+    }
+    const float* vp = (const float*) v->data;
+    float*       gp = (float*) node->data;  // == g->data
+    for (int64_t o = 0; o < oc; ++o) {
+        double s = 0.0;
+        for (int64_t r = 0; r < n_rest; ++r) {
+            const float x = vp[r + o * n_rest];
+            s += (double) x * (double) x;
+        }
+        gp[o] = (float) std::sqrt(s);
+    }
+}
+
 // ---------------------------------------------------------------- 能力声明
 
 bool sup_f32(const Tensor* t) {
@@ -1699,6 +1838,27 @@ bool cpu_supports_op(const Tensor* t) {
         case OP_CONV_TRANSPOSE_2D:
             return sup_srcs_f32(t, 2);
 
+        // 设备端优化器步：F32 且 param/grad/状态/结果均连续（主机实现要求参数连续）
+        case OP_OPT_STEP_ADAMW:
+            return sup_srcs_f32(t, 4) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]) && tensor_is_contiguous(t->src[2]) &&
+                   tensor_is_contiguous(t->src[3]) && tensor_is_contiguous(t);
+        case OP_OPT_STEP_SGD:
+            return sup_srcs_f32(t, 3) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]) && tensor_is_contiguous(t->src[2]) &&
+                   tensor_is_contiguous(t);
+
+        // M4.5：梯度裁剪原语 / WeightNorm 同步（F32，连续）
+        case OP_SUM_SQR_ACC:
+            return sup_srcs_f32(t, 2) && tensor_nelements(t->src[0]) == 1 &&
+                   tensor_is_contiguous(t->src[1]);
+        case OP_CLIP_SCALE_INPLACE:
+            return sup_srcs_f32(t, 2) && tensor_nelements(t->src[1]) == 1 &&
+                   tensor_is_contiguous(t->src[0]);
+        case OP_WEIGHTNORM_SYNC:
+            return sup_srcs_f32(t, 2) && tensor_is_contiguous(t->src[0]) &&
+                   tensor_is_contiguous(t->src[1]);
+
         default:
             return false;
     }
@@ -1891,6 +2051,21 @@ bool cpu_compute_node(Tensor* node) {
             return true;
         case OP_CONV_TRANSPOSE_2D:
             compute_conv_transpose_2d(node);
+            return true;
+        case OP_OPT_STEP_ADAMW:
+            compute_opt_step_adamw(node);
+            return true;
+        case OP_OPT_STEP_SGD:
+            compute_opt_step_sgd(node);
+            return true;
+        case OP_SUM_SQR_ACC:
+            compute_sum_sqr_acc(node);
+            return true;
+        case OP_CLIP_SCALE_INPLACE:
+            compute_clip_scale_inplace(node);
+            return true;
+        case OP_WEIGHTNORM_SYNC:
+            compute_weightnorm_sync(node);
             return true;
         default:
             TRC_ABORT("CPU 后端不支持算子 %s (op=%d)", op_name(node->op), (int) node->op);
