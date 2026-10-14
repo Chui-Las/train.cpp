@@ -176,7 +176,8 @@ Tensor* tensor_new_view(Context* ctx, Tensor* a, Op op, int n_dims, const int64_
 
     if (!context_no_alloc(ctx)) {
         TRC_ASSERT(a->data != nullptr, "视图源张量数据为空");
-        v->data = (uint8_t*) a->data + offset;
+        v->data        = (uint8_t*) a->data + offset;
+        v->data_offset = a->data_offset + offset;
     }
     return v;
 }

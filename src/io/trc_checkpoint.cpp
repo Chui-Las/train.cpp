@@ -39,6 +39,11 @@ const char* optim_type_str(OptimType t) {
     return t == OptimType::SGD ? "sgd" : "adamw";
 }
 
+// 张量是否已分配存储（M4.4d：不可映射 device-local 的 data 为空但 buffer 非空）
+bool tensor_has_storage(const Tensor* t) {
+    return t != nullptr && (t->data != nullptr || t->buffer != nullptr);
+}
+
 // ---------------- 优化器分区（v2：名字 + 优化器 + 可选调度器） ----------------
 
 struct Partition {
@@ -313,7 +318,7 @@ bool load_partition(const GgufFile* f, const KeyScheme& ks, const Partition& par
         states.reserve((size_t) n_states);
         for (int64_t i = 0; i < n_states; ++i) {
             Tensor* s = optim_state(opt, i);
-            if (s->data == nullptr) {
+            if (!tensor_has_storage(s)) {
                 return fail("优化器状态未分配（请先调用 optim_alloc_state）");
             }
             states.push_back(s);
@@ -400,7 +405,7 @@ bool verify_partition(const GgufFile* f, const KeyScheme& ks, const Partition& p
         return fail("参数名列表不匹配");
     }
 
-    const bool mem_has_state = optim_state_count(opt) > 0 && optim_state(opt, 0)->data != nullptr;
+    const bool mem_has_state = optim_state_count(opt) > 0 && tensor_has_storage(optim_state(opt, 0));
     const bool has_state     = gguf_get_bool(f, ks.k("has_state").c_str());
     if (mem_has_state != has_state) {
         return fail("优化器状态存在性不一致");
@@ -513,9 +518,9 @@ bool checkpoint_save(const char* path, const CheckpointItems& items, const char*
         // 状态：要么全部分配、要么全未分配
         bool has_state = optim_state_count(opt) > 0;
         if (optim_state_count(opt) > 0) {
-            const bool allocated = optim_state(opt, 0)->data != nullptr;
+            const bool allocated = tensor_has_storage(optim_state(opt, 0));
             for (int64_t i = 0; i < optim_state_count(opt); ++i) {
-                TRC_ASSERT((optim_state(opt, i)->data != nullptr) == allocated,
+                TRC_ASSERT(tensor_has_storage(optim_state(opt, i)) == allocated,
                            "checkpoint_save: 优化器 %s 状态分配不一致", part.name.c_str());
             }
             has_state = allocated;

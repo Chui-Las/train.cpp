@@ -58,6 +58,14 @@ Tensor* view_root(Tensor* t) {
     return t;
 }
 
+// 张量实际所属的 Buffer（视图自身不持有 buffer，需沿 view_src 链上溯到根；M4.4）
+Buffer* owner_buffer_of(const Tensor* t) {
+    while (t != nullptr && t->buffer == nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t != nullptr ? t->buffer : nullptr;
+}
+
 // 函数内静态变量：避免静态初始化顺序问题；首次使用时注册编译期已知后端
 std::vector<Device*>& device_registry() {
     static std::vector<Device*> devices = [] {
@@ -168,31 +176,38 @@ namespace {
               api, total, need_mib, props.name.c_str());
 }
 
-// 视图数据解析（旧/新分配 API 共用；视图按创建顺序，其源一定先于视图解析）
+// 视图数据解析（旧/新分配 API 共用；视图按创建顺序，其源一定先于视图解析）。
+// M4.4：data_offset 为"源 buffer 内绝对偏移"，与 data 是否可映射无关；data 仅在源可映射时解析。
 void resolve_view_data(Context* ctx, int n_tensors) {
     for (int i = 0; i < n_tensors; ++i) {
         Tensor* t = context_tensor(ctx, i);
         if (t->view_src == nullptr) {
             continue;
         }
-        TRC_ASSERT(t->view_src->data != nullptr, "视图源张量 %s 的数据未解析", t->view_src->name);
-        t->data = (uint8_t*) t->view_src->data + t->view_offs;
+        Tensor* src = t->view_src;
+        // 源可以是：已分配 buffer 的普通张量（buffer 非空）、主机 arena（data 非空），
+        // 或更早解析过的视图（view_src 非空，data_offset 已累加）——M4.4b 去映射后 data 可为空
+        TRC_ASSERT(src->data != nullptr || src->buffer != nullptr || src->view_src != nullptr,
+                   "视图源张量 %s 的数据未解析", src->name);
+        t->data_offset = src->data_offset + t->view_offs;
+        t->data        = src->data != nullptr ? (uint8_t*) src->data + t->view_offs : nullptr;
     }
 }
 
 // 兑现延迟填充（autograd 标量常量、权重初始化等；旧/新分配 API 共用）
 void apply_pending_fills(Context* ctx) {
     for (const Context::PendingFill& fill : ctx->pending_fills) {
-        TRC_ASSERT(fill.tensor->data != nullptr, "延迟填充 %s 的数据未分配", fill.tensor->name);
+        TRC_ASSERT(fill.tensor->data != nullptr || fill.tensor->buffer != nullptr,
+                   "延迟填充 %s 的数据未分配", fill.tensor->name);
         switch (fill.kind) {
             case Context::PendingFill::CONST: {
-                // 注意：常量填充可能是多元素张量（如权重初始化为 1/0）
-                // R13：直接写主机数据，不再分配临时 vector
+                // 常量填充可能是多元素张量（如权重初始化为 1/0）。
+                // M4.4c：统一走 tensor_fill_values——有 buffer 时设备 fill（不可映射 device-local 也可），
+                // 否则回退主机直写（arena 张量 data 非空）。
                 Tensor* t = fill.tensor;
                 TRC_ASSERT(tensor_is_contiguous(t), "延迟常量填充 %s 必须连续", t->name);
-                const size_t n = (size_t) tensor_nelements(t);
-                float*       p = (float*) t->data;
-                std::fill(p, p + n, fill.a);
+                TensorFill req{t, fill.a};
+                tensor_fill_values(&req, 1);
             } break;
             case Context::PendingFill::UNIFORM: {
                 Rng rng;
@@ -224,7 +239,7 @@ Buffer* buffer_alloc_ctx_tensors(Context* ctx, BufferType* buft) {
     size_t total = 0;
     for (int i = 0; i < n_tensors; ++i) {
         Tensor* t = context_tensor(ctx, i);
-        if (t->view_src != nullptr || t->data != nullptr) {
+        if (t->view_src != nullptr || t->data != nullptr || t->buffer != nullptr) {
             continue;
         }
         total = align_up(total, align) + tensor_nbytes(t);
@@ -254,12 +269,13 @@ Buffer* buffer_alloc_ctx_tensors(Context* ctx, BufferType* buft) {
     size_t offset = 0;
     for (int i = 0; i < n_tensors; ++i) {
         Tensor* t = context_tensor(ctx, i);
-        if (t->view_src != nullptr || t->data != nullptr) {
+        if (t->view_src != nullptr || t->data != nullptr || t->buffer != nullptr) {
             continue;
         }
         offset = align_up(offset, align);
-        t->buffer = buf;
-        t->data = (uint8_t*) buf->base() + offset;
+        t->buffer      = buf;
+        t->data_offset = offset;
+        t->data        = buf->base() != nullptr ? (uint8_t*) buf->base() + offset : nullptr;
         offset += tensor_nbytes(t);
     }
 
@@ -291,7 +307,7 @@ Buffer* buffer_alloc_graph_tensors(Graph* graph, BufferType* buft) {
     // 1) 覆盖校验：所有待分配的非视图张量必须在图内，否则无法计算生命周期
     for (int i = 0; i < n_tensors; ++i) {
         Tensor* t = context_tensor(ctx, i);
-        if (t->view_src != nullptr || t->data != nullptr) {
+        if (t->view_src != nullptr || t->data != nullptr || t->buffer != nullptr) {
             continue;
         }
         TRC_ASSERT(node_index.count(t) != 0,
@@ -331,7 +347,7 @@ Buffer* buffer_alloc_graph_tensors(Graph* graph, BufferType* buft) {
 
     for (int i = 0; i < n_tensors; ++i) {
         Tensor* t = context_tensor(ctx, i);
-        if (t->view_src != nullptr || t->data != nullptr) {
+        if (t->view_src != nullptr || t->data != nullptr || t->buffer != nullptr) {
             continue;
         }
         const auto nr          = plan.n_readers.find(t);
@@ -416,8 +432,9 @@ Buffer* buffer_alloc_graph_tensors(Graph* graph, BufferType* buft) {
     backend_note_buffer_alloc(buf, buf->size());  // M2.2a：核心分配统计
 
     for (const Placement& p : placements) {
-        p.t->buffer = buf;
-        p.t->data   = (uint8_t*) buf->base() + p.offset;
+        p.t->buffer      = buf;
+        p.t->data_offset = p.offset;
+        p.t->data        = buf->base() != nullptr ? (uint8_t*) buf->base() + p.offset : nullptr;
     }
     resolve_view_data(ctx, n_tensors);
     apply_pending_fills(ctx);
@@ -460,15 +477,17 @@ void buffer_free(Buffer* buf) {
         for (int i = 0; i < n_tensors; ++i) {
             Tensor* t = context_tensor(ctx, i);
             if (t->view_src != nullptr && view_root(t)->buffer == buf) {
-                t->data = nullptr;
+                t->data        = nullptr;
+                t->data_offset = 0;
             }
         }
         // 再失效直接归属该 buffer 的张量
         for (int i = 0; i < n_tensors; ++i) {
             Tensor* t = context_tensor(ctx, i);
             if (t->buffer == buf) {
-                t->buffer = nullptr;
-                t->data   = nullptr;
+                t->buffer      = nullptr;
+                t->data        = nullptr;
+                t->data_offset = 0;
             }
         }
     }
@@ -479,11 +498,12 @@ void tensor_set(Tensor* t, const void* data, size_t offset, size_t size) {
     TRC_ASSERT(t != nullptr, "tensor_set: 张量为空");
     TRC_ASSERT(offset + size <= tensor_nbytes(t), "tensor_set: 越界 (offset=%zu size=%zu nbytes=%zu)",
                offset, size, tensor_nbytes(t));
-    if (t->buffer != nullptr) {
-        t->buffer->set_tensor(t, offset, data, size);
+    if (Buffer* buf = owner_buffer_of(t); buf != nullptr) {
+        // 视图也走根的 buffer（Buffer::set_tensor 按 t->data_offset 定位；M4.4）
+        buf->set_tensor(t, offset, data, size);
         return;
     }
-    // 视图/主机内存直写
+    // 主机内存直写（arena / 未绑定 buffer）
     TRC_ASSERT(t->data != nullptr, "tensor_set: 张量既未绑定 buffer 也无数据");
     std::memcpy((uint8_t*) t->data + offset, data, size);
 }
@@ -492,12 +512,72 @@ void tensor_get(const Tensor* t, void* data, size_t offset, size_t size) {
     TRC_ASSERT(t != nullptr, "tensor_get: 张量为空");
     TRC_ASSERT(offset + size <= tensor_nbytes(t), "tensor_get: 越界 (offset=%zu size=%zu nbytes=%zu)",
                offset, size, tensor_nbytes(t));
-    if (t->buffer != nullptr) {
-        t->buffer->get_tensor(t, offset, data, size);
+    if (Buffer* buf = owner_buffer_of(t); buf != nullptr) {
+        buf->get_tensor(t, offset, data, size);
         return;
     }
     TRC_ASSERT(t->data != nullptr, "tensor_get: 张量既未绑定 buffer 也无数据");
     std::memcpy(data, (const uint8_t*) t->data + offset, size);
+}
+
+// ---------------- 批量填充（M4.2）----------------
+
+namespace {
+
+// 主机填充（要求张量已有可写主机数据）
+void host_fill_one(Tensor* t, float value, const char* who) {
+    TRC_ASSERT(t != nullptr && t->type == TYPE_F32, "%s: 仅支持 F32 张量", who);
+    TRC_ASSERT(tensor_is_contiguous(t), "%s: 张量 %s 必须连续", who, t->name);
+    TRC_ASSERT(t->data != nullptr, "%s: 张量 %s 无主机数据（尚未分配？）", who, t->name);
+    float*       p = (float*) t->data;
+    const size_t n = (size_t) tensor_nelements(t);
+    std::fill(p, p + n, value);
+}
+
+} // namespace
+
+bool Device::fill_tensors(const TensorFill* fills, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        host_fill_one(fills[i].tensor, fills[i].value, "fill_tensors");
+    }
+    return true;
+}
+
+void tensor_fill_values(const TensorFill* fills, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    // 若全部张量同属一个设备，合并为一次设备填充；否则逐张量回退
+    Device* dev       = nullptr;
+    bool    all_same  = true;
+    for (size_t i = 0; i < count; ++i) {
+        Tensor* t = fills[i].tensor;
+        if (t == nullptr || t->buffer == nullptr) {
+            all_same = false;
+            break;
+        }
+        Device* d = t->buffer->buffer_type()->device();
+        if (dev == nullptr) {
+            dev = d;
+        } else if (dev != d) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same && dev != nullptr) {
+        dev->fill_tensors(fills, count);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        Tensor* t = fills[i].tensor;
+        if (t != nullptr && t->buffer != nullptr) {
+            Device* d = t->buffer->buffer_type()->device();
+            if (d != nullptr && d->fill_tensors(&fills[i], 1)) {
+                continue;
+            }
+        }
+        host_fill_one(t, fills[i].value, "tensor_fill_values");
+    }
 }
 
 } // namespace traincpp

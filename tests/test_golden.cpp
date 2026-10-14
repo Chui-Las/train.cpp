@@ -293,7 +293,8 @@ TRC_TEST(golden_cases) {
         int64_t n_bad = 0;
         for (int64_t i = 0; i < n; ++i) {
             const size_t off = tensor_offset_linear(out, i);
-            const float got = *(const float*) ((const uint8_t*) out->data + off);
+            float        got = 0.0f;
+            tensor_get(out, &got, off, sizeof(float));  // M4.4d：经 buffer/staging，兼容不可映射
             const float exp = ((const float*) out_npy.raw.data())[(size_t) i];
             const double diff = std::fabs((double) got - exp);
             const double tol = atol + rtol * std::fabs((double) exp);
@@ -314,8 +315,9 @@ TRC_TEST(golden_cases) {
         if (!ok) {
             char msg[512];
             const float exp_v = ((const float*) out_npy.raw.data())[(size_t) max_idx];
-            const size_t off = tensor_offset_linear(out, max_idx);
-            const float got_v = *(const float*) ((const uint8_t*) out->data + off);
+            const size_t off   = tensor_offset_linear(out, max_idx);
+            float        got_v = 0.0f;
+            tensor_get(out, &got_v, off, sizeof(float));  // M4.4d：经 buffer/staging
             std::snprintf(msg, sizeof(msg),
                           "黄金用例 %s (op=%s) 失败: 形状%s 超差 %lld/%lld 元素, 最大绝对差 %.3g "
                           "(下标 %lld: 实际 %.6g 期望 %.6g)",

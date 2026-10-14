@@ -197,20 +197,31 @@ uint32_t find_memory_type(const VulkanState& s, uint32_t type_bits, VkMemoryProp
     return best;
 }
 
-// 打印设备内存类型/堆（FIX-003 / Q26；2026-09-27 默认回退为 host-visible）。
-// 默认走 host-visible（系统内存，GPU 计算经 PCIe 访问）；device-local 需 TRC_VK_DEVICE_LOCAL=1 显式开启。
+// 计算缓冲默认内存类型（M4.5e）：优先 device-local。
+//   ① 无可用"可映射 device-local" → 不可映射 device-local（真显存 + staging）；
+//   ② 可映射与不可映射 device-local 同在：仅当不可映射堆显著更大（独显小 BAR 窗 vs 全显存）才选它，
+//      否则选可映射（核显统一内存/ReBAR，避免无谓 staging）。
+//   ③ 无 device-local → host-visible。
+uint32_t default_compute_memory_type(const VulkanState& s, uint32_t type_bits);
+
+// 打印设备内存类型/堆（FIX-003 / Q26；2026-09-27 默认回退 host-visible；M4.5e 默认切回优先 device-local）。
 void log_memory_types(const VulkanState& s) {
     const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    const uint32_t host_type = find_memory_type(s, ~0u, required, false);  // 默认
-    const uint32_t dl_type   = find_memory_type(s, ~0u, required, true);   // TRC_VK_DEVICE_LOCAL=1 时
+    const uint32_t host_type = find_memory_type(s, ~0u, required, false);
+    const uint32_t dl_map    = find_memory_type(s, ~0u, required, true);  // TRC_VK_DEVICE_LOCAL=1 时
+    const uint32_t def_type  = default_compute_memory_type(s, ~0u);
+    const bool def_unmapped =
+        def_type != UINT32_MAX &&
+        (s.mem_props.memoryTypes[def_type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0;
     for (uint32_t i = 0; i < s.mem_props.memoryTypeCount; ++i) {
         const VkMemoryType& t = s.mem_props.memoryTypes[i];
         const VkMemoryHeap& h = s.mem_props.memoryHeaps[t.heapIndex];
-        const char* tag = (i == host_type && i == dl_type) ? " [计算缓冲默认]"
-                          : (i == host_type)               ? " [计算缓冲默认(host)]"
-                          : (i == dl_type)                 ? " [TRC_VK_DEVICE_LOCAL=1 时优先]"
-                                                           : "";
+        const char* tag = (i == def_type && def_unmapped) ? " [计算缓冲默认：真显存+staging]"
+                          : (i == def_type)              ? " [计算缓冲默认]"
+                          : (i == dl_map && i != def_type) ? " [TRC_VK_DEVICE_LOCAL=1 时优先]"
+                          : (i == host_type && i != def_type) ? " [host-visible 基线]"
+                                                              : "";
         TRC_LOG_INFO("[vulkan] memory type %u: flags=0x%03x heap=%u（%.0f MiB%s）%s%s%s%s%s", i,
                      (unsigned) t.propertyFlags, t.heapIndex, (double) h.size / (1024.0 * 1024.0),
                      (h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? ", device-local heap" : "",
@@ -219,6 +230,197 @@ void log_memory_types(const VulkanState& s) {
                      (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " HOST_COHERENT" : "",
                      (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " HOST_CACHED" : "", tag);
     }
+}
+
+// 不可映射的 device-local 内存类型（M4.4b）：DEVICE_LOCAL 且无 HOST_VISIBLE。
+uint32_t find_device_local_unmappable(const VulkanState& s, uint32_t type_bits) {
+    for (uint32_t i = 0; i < s.mem_props.memoryTypeCount; ++i) {
+        if ((type_bits & (1u << i)) == 0) {
+            continue;
+        }
+        const VkMemoryPropertyFlags f = s.mem_props.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+            (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+// 计算缓冲默认内存类型（M4.5e）：优先 device-local（见 log_memory_types 上方说明）
+uint32_t default_compute_memory_type(const VulkanState& s, uint32_t type_bits) {
+    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const uint32_t dl_map   = find_memory_type(s, type_bits, required, /*prefer_device_local=*/true);
+    const bool     map_is_dl = dl_map != UINT32_MAX &&
+                               (s.mem_props.memoryTypes[dl_map].propertyFlags &
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    const uint32_t dl_unmap = find_device_local_unmappable(s, type_bits);
+
+    if (dl_unmap == UINT32_MAX) {
+        return map_is_dl ? dl_map : find_memory_type(s, type_bits, required, false);
+    }
+    if (!map_is_dl) {
+        return dl_unmap;  // 无可映射 device-local → 真显存 + staging
+    }
+    // 两者都存在：仅当不可映射堆显著更大（独显小 BAR 窗 vs 全显存）才选不可映射；
+    // 统一内存（核显）两堆同源 → 选可映射，避免无谓 staging。
+    const VkDeviceSize h_unmap =
+        s.mem_props.memoryHeaps[s.mem_props.memoryTypes[dl_unmap].heapIndex].size;
+    const VkDeviceSize h_map = s.mem_props.memoryHeaps[s.mem_props.memoryTypes[dl_map].heapIndex].size;
+    return h_unmap > h_map ? dl_unmap : dl_map;
+}
+
+// ---------------- 共享 staging（M4.4b）----------------
+// 不可映射 device-local 缓冲的主机↔设备传输：一个 host-visible、常驻映射的共享 staging 缓冲 +
+// 专用 transfer 命令池/fence；每次同步拷贝（提交并等待）。只承载初始化/IO/checkpoint 等低频块，
+// 不进入每步热路径（每步重活为设备端 kernel）。
+
+// 确保 staging 缓冲至少 size 字节；返回是否就绪（失败中止）。
+void staging_ensure(size_t size) {
+    VulkanState& s = vulkan_state();
+    const size_t need = size == 0 ? VK_BUFFER_ALIGN_MIN : size;
+    if (s.stage_mapped != nullptr && s.stage_size >= need) {
+        return;
+    }
+    if (s.stage_mapped != nullptr) {
+        vkUnmapMemory(s.device, s.stage_memory);
+        vkFreeMemory(s.device, s.stage_memory, nullptr);
+        vkDestroyBuffer(s.device, s.stage_buffer, nullptr);
+        s.stage_buffer = VK_NULL_HANDLE;
+        s.stage_memory = VK_NULL_HANDLE;
+        s.stage_mapped = nullptr;
+        s.stage_size   = 0;
+    }
+
+    VkBufferCreateInfo bci{};
+    bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size        = need;
+    bci.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    TRC_VK_CHECK(vkCreateBuffer(s.device, &bci, nullptr, &s.stage_buffer),
+                 "Vulkan staging：缓冲创建失败（%zu 字节）", need);
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(s.device, s.stage_buffer, &req);
+    const uint32_t mt = find_memory_type(
+        s, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        /*prefer_device_local=*/false);
+    TRC_ASSERT(mt != UINT32_MAX, "Vulkan staging：找不到 host-visible 内存类型");
+
+    VkMemoryAllocateInfo ai{};
+    ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = mt;
+    TRC_VK_CHECK(vkAllocateMemory(s.device, &ai, nullptr, &s.stage_memory),
+                 "Vulkan staging：内存分配失败（%zu 字节）", (size_t) req.size);
+    TRC_VK_CHECK(vkBindBufferMemory(s.device, s.stage_buffer, s.stage_memory, 0),
+                 "Vulkan staging：绑定失败");
+    TRC_VK_CHECK(vkMapMemory(s.device, s.stage_memory, 0, VK_WHOLE_SIZE, 0, &s.stage_mapped),
+                 "Vulkan staging：映射失败");
+    s.stage_size = need;
+}
+
+void transfer_begin(VkCommandBuffer& cmd) {
+    VulkanState& s = vulkan_state();
+    if (s.transfer_pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo pci{};
+        pci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = s.queue_family;
+        TRC_VK_CHECK(vkCreateCommandPool(s.device, &pci, nullptr, &s.transfer_pool),
+                     "Vulkan staging：transfer 命令池创建失败");
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        TRC_VK_CHECK(vkCreateFence(s.device, &fci, nullptr, &s.transfer_fence),
+                     "Vulkan staging：transfer fence 创建失败");
+    }
+    vkResetCommandPool(s.device, s.transfer_pool, 0);
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool        = s.transfer_pool;
+    ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    TRC_VK_CHECK(vkAllocateCommandBuffers(s.device, &ai, &cmd), "Vulkan staging：命令缓冲分配失败");
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    TRC_VK_CHECK(vkBeginCommandBuffer(cmd, &bi), "Vulkan staging：命令缓冲 begin 失败");
+}
+
+void transfer_end(VkCommandBuffer cmd) {
+    VulkanState& s = vulkan_state();
+    TRC_VK_CHECK(vkEndCommandBuffer(cmd), "Vulkan staging：命令缓冲 end 失败");
+    VkSubmitInfo si{};
+    si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    TRC_VK_CHECK(vkResetFences(s.device, 1, &s.transfer_fence), "Vulkan staging：fence 重置失败");
+    const VkResult r = vkQueueSubmit(s.queue, 1, &si, s.transfer_fence);
+    if (r != VK_SUCCESS) {
+        trc_vk_fail_submit(r, "staging 传输提交", 0, s.live_buffer_bytes);
+    }
+    const VkResult w = vkWaitForFences(s.device, 1, &s.transfer_fence, VK_TRUE, UINT64_MAX);
+    if (w != VK_SUCCESS) {
+        trc_vk_fail_submit(w, "staging 传输等待", 0, s.live_buffer_bytes);
+    }
+    vkFreeCommandBuffers(s.device, s.transfer_pool, 1, &cmd);
+}
+
+// 主机 → 设备：写 staging 后拷入 dst[dst_off, dst_off+size)
+void staging_upload(VkBuffer dst, size_t dst_off, const void* src, size_t size) {
+    staging_ensure(size);
+    std::memcpy(vulkan_state().stage_mapped, src, size);
+    VkCommandBuffer cmd;
+    transfer_begin(cmd);
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    VkBufferCopy region{};
+    region.srcOffset = 0;
+    region.dstOffset = (VkDeviceSize) dst_off;
+    region.size      = (VkDeviceSize) size;
+    vkCmdCopyBuffer(cmd, vulkan_state().stage_buffer, dst, 1, &region);
+    transfer_end(cmd);
+}
+
+// 设备 → 主机：拷出 src[src_off, src_off+size) 到 staging 后读回
+void staging_download(VkBuffer src, size_t src_off, void* dst, size_t size) {
+    staging_ensure(size);
+    VkCommandBuffer cmd;
+    transfer_begin(cmd);
+    VkBufferCopy region{};
+    region.srcOffset = (VkDeviceSize) src_off;
+    region.dstOffset = 0;
+    region.size      = (VkDeviceSize) size;
+    vkCmdCopyBuffer(cmd, src, vulkan_state().stage_buffer, 1, &region);
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                         nullptr, 0, nullptr);
+    transfer_end(cmd);
+    std::memcpy(dst, vulkan_state().stage_mapped, size);
+}
+
+// 设备端填充 dst[off, off+size) = value（不可映射缓冲的 clear）
+void staging_fill(VkBuffer dst, size_t off, size_t size, uint32_t value) {
+    TRC_ASSERT(off % 4 == 0 && size % 4 == 0, "Vulkan staging fill 要求 4 字节对齐");
+    VkCommandBuffer cmd;
+    transfer_begin(cmd);
+    vkCmdFillBuffer(cmd, dst, (VkDeviceSize) off, (VkDeviceSize) size, value);
+    VkMemoryBarrier mb{};
+    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                         &mb, 0, nullptr, 0, nullptr);
+    transfer_end(cmd);
 }
 
 // 分块提交节点数（FIX-004 / Q28）：TRC_VK_CHUNK_NODES=n，默认 0 = 整图单次提交。
@@ -522,6 +724,10 @@ bool init_state(VulkanState& s) {
         return false;
     }
     log_memory_types(s);
+    if (std::getenv("TRC_VK_FORCE_STAGING") != nullptr) {
+        TRC_LOG_INFO("[vulkan] TRC_VK_FORCE_STAGING=1：计算缓冲走不可映射 device-local + staging"
+                     "（无该内存类型时为 host-visible 但不映射，用于本地覆盖 staging 路径）");
+    }
     TRC_LOG_INFO("Vulkan 后端就绪：%s（驱动 %s，%s，显存 %.0f MiB，storage offset align=%u，"
                  "maxWorkGroupCount=%u/%u/%u，maxStorageBufferRange=%.0f MiB，maxBufferSize=%.0f MiB，"
                  "maxMemoryAllocationSize=%.0f MiB）",
@@ -644,7 +850,7 @@ public:
     VulkanDevice() {
         const VulkanState& s = vulkan_state();
         props_.name           = std::string("Vulkan: ") + s.name;
-        props_.description    = "Vulkan 计算后端";
+        props_.description    = "Vulkan 后端（M1.4b：逐元素/一元 kernel）";
         props_.type           = s.integrated ? DeviceType::IGPU : DeviceType::GPU;
         props_.memory_total   = s.memory_total;
         props_.memory_free    = s.memory_total;  // 精确值需 VK_EXT_memory_budget，后续再加
@@ -686,6 +892,53 @@ public:
             }
             compute_begin(gc);
         }
+        return true;
+    }
+
+    // 批量填充（M4.2）：单次提交内对每个 F32 连续张量执行 vkCmdFillBuffer，
+    // 末尾一个 transfer-write → shader 屏障，保证后续 compute 可见。
+    bool fill_tensors(const TensorFill* fills, size_t count) override {
+        if (count == 0) {
+            return true;
+        }
+        VulkanGraphContext gc;
+        compute_begin(gc);
+        bool any = false;
+        for (size_t i = 0; i < count; ++i) {
+            Tensor* t = fills[i].tensor;
+            TRC_ASSERT(t != nullptr && t->type == TYPE_F32, "Vulkan fill_tensors 仅支持 F32 张量");
+            TRC_ASSERT(tensor_is_contiguous(t), "Vulkan fill_tensors 要求张量 %s 连续", t->name);
+
+            Buffer*       buf   = t->buffer;
+            const Tensor* owner = t;
+            while (buf == nullptr && owner->view_src != nullptr) {
+                owner = owner->view_src;
+                buf   = owner->buffer;
+            }
+            TRC_ASSERT(buf != nullptr, "Vulkan fill_tensors：张量 %s 未绑定 buffer", t->name);
+
+            const size_t bytes = (size_t) tensor_nelements(t) * sizeof(float);
+            if (bytes == 0) {
+                continue;
+            }
+            // M4.4：按 data_offset 定位（不可映射缓冲同样适用）
+            const size_t offset = t->data_offset;
+            uint32_t pattern = 0;
+            std::memcpy(&pattern, &fills[i].value, sizeof(float));
+            vkCmdFillBuffer(gc.cmd, static_cast<const VulkanBuffer*>(buf)->vk_buffer(),
+                            (VkDeviceSize) offset, (VkDeviceSize) bytes, pattern);
+            any = true;
+        }
+        if (any) {
+            VkMemoryBarrier mb{};
+            mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(gc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        }
+        compute_end(gc, true);
         return true;
     }
 
@@ -745,27 +998,45 @@ VulkanBuffer* VulkanBuffer::create(VulkanBufferType* buft, size_t size) {
         TRC_LOG_WARN("Vulkan 后端：找不到 host-visible+coherent 内存类型（M1.4 需要）");
         return nullptr;
     }
-    // 放置策略（2026-09-27 修订 FIX-003 / Q26）：
-    //   默认 host-visible（系统内存）：GPU 负责计算、经 PCIe 访问。库的优化器/梯度清零是主机标量实现，
-    //   若把缓冲放进 device-local（独显上多为 write-combined）会让 CPU 逐元素读改写经 PCIe，成为瓶颈、
-    //   反而使 GPU 闲置——故默认回到 host-visible（与 FIX-003 之前一致）。
-    //   TRC_VK_DEVICE_LOCAL=1 才优先 device-local（须配合设备端优化器，见 FIX-005 规划）；
-    //   TRC_VK_HOST_MEMORY=1 显式强制 host-visible（保留作为基线/测试开关）。
+    // 放置策略（2026-09-27 修订 FIX-003 / Q26；2026-10-01 M4.4b 追加 staging；M4.5e 默认切换）：
+    //   **默认优先 device-local**（M4.5e，用户拍板"能用 device-local 就用"）：
+    //     ① 有"不可映射的 device-local"（独显真显存）→ 用它 + 共享 staging（`base()==nullptr`）；
+    //     ② 否则有"可映射的 device-local"（核显/ReBAR）→ 用它并映射（`base()` 可解引用）；
+    //     ③ 都没有 → host-visible（系统内存）。
+    //   TRC_VK_HOST_MEMORY=1 强制 host-visible（基线/测试/A-B）。
+    //   TRC_VK_DEVICE_LOCAL=1 只优先"可映射的 device-local"（A-B 对照，不进入 staging）。
+    //   TRC_VK_FORCE_STAGING=1 强制"不可映射 device-local + staging"（测试模式）。
     const char* dl_env   = std::getenv("TRC_VK_DEVICE_LOCAL");
     const char* host_env = std::getenv("TRC_VK_HOST_MEMORY");
+    const char* stg_env  = std::getenv("TRC_VK_FORCE_STAGING");
     const bool  want_device_local = dl_env != nullptr && *dl_env != '\0';
     const bool  force_host        = host_env != nullptr && *host_env != '\0';
-    uint32_t    preferred_type    = fallback_type;
-    if (want_device_local && !force_host) {
+    const bool  force_staging     = stg_env != nullptr && *stg_env != '\0';
+
+    const uint32_t dl_unmappable = find_device_local_unmappable(s, req.memoryTypeBits);
+    uint32_t       preferred_type = fallback_type;
+    bool           map_memory     = true;  // 是否映射出可解引用主机指针（false=走 staging）
+    if (force_host) {
+        // 基线：host-visible（fallback）
+    } else if (force_staging) {
+        preferred_type = dl_unmappable != UINT32_MAX ? dl_unmappable : fallback_type;
+        map_memory     = false;
+    } else if (want_device_local) {
         const uint32_t dl = find_memory_type(s, req.memoryTypeBits, required, true);
         if (dl != UINT32_MAX) {
             preferred_type = dl;
         }
+    } else {
+        // M4.5e 默认：优先 device-local（详见 default_compute_memory_type）
+        const uint32_t def = default_compute_memory_type(s, req.memoryTypeBits);
+        preferred_type = def != UINT32_MAX ? def : fallback_type;
+        map_memory = (s.mem_props.memoryTypes[preferred_type].propertyFlags &
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     }
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void*          mapped = nullptr;
-    const auto     allocate_type = [&](uint32_t mem_type) -> bool {
+    const auto     allocate_type = [&](uint32_t mem_type, bool map) -> bool {
         VkMemoryAllocateInfo ai{};
         ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         ai.allocationSize  = req.size;
@@ -774,8 +1045,12 @@ VulkanBuffer* VulkanBuffer::create(VulkanBufferType* buft, size_t size) {
             memory = VK_NULL_HANDLE;
             return false;
         }
-        if (vkBindBufferMemory(s.device, buffer, memory, 0) != VK_SUCCESS ||
-            vkMapMemory(s.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+        if (vkBindBufferMemory(s.device, buffer, memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(s.device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+            return false;
+        }
+        if (map && vkMapMemory(s.device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
             vkFreeMemory(s.device, memory, nullptr);
             memory = VK_NULL_HANDLE;
             mapped = nullptr;
@@ -784,12 +1059,11 @@ VulkanBuffer* VulkanBuffer::create(VulkanBufferType* buft, size_t size) {
         return true;
     };
 
-    bool placed = allocate_type(preferred_type);
+    bool placed = allocate_type(preferred_type, map_memory);
     if (!placed && preferred_type != fallback_type) {
-        TRC_LOG_WARN("Vulkan 后端：device-local 缓冲分配/映射失败（%zu 字节，memory type %u），"
-                     "回退 host-visible（系统内存，性能较低且占用 RAM）",
+        TRC_LOG_WARN("Vulkan 后端：首选缓冲分配/映射失败（%zu 字节，memory type %u），回退 host-visible",
                      alloc_size, preferred_type);
-        placed = allocate_type(fallback_type);
+        placed = allocate_type(fallback_type, map_memory);
     }
     if (!placed) {
         vkDestroyBuffer(s.device, buffer, nullptr);
@@ -802,7 +1076,12 @@ VulkanBuffer* VulkanBuffer::create(VulkanBufferType* buft, size_t size) {
                      (double) s.max_memory_allocation_size / (1024.0 * 1024.0));
         return nullptr;
     }
-    std::memset(mapped, 0, alloc_size);
+    if (mapped != nullptr) {
+        std::memset(mapped, 0, alloc_size);
+    } else if (alloc_size % 4 == 0) {
+        // M4.4b：不可映射 device-local 显式设备端清零，保持与 host-visible 一致的"新建缓冲为零"
+        staging_fill(buffer, 0, alloc_size, 0);
+    }
 
     return new VulkanBuffer(buft, buffer, memory, mapped, alloc_size);
 }
@@ -828,16 +1107,33 @@ VulkanBuffer::~VulkanBuffer() {
 BufferType* VulkanBuffer::buffer_type() const { return buft_; }
 
 void VulkanBuffer::set_tensor(Tensor* t, size_t offset, const void* data, size_t size) {
-    TRC_ASSERT(t != nullptr && t->data != nullptr, "VulkanBuffer::set_tensor: 张量数据为空");
-    std::memcpy((uint8_t*) t->data + offset, data, size);
+    // M4.4：按 data_offset 定位（视图也传入本 buffer）；不可映射缓冲经 staging 上传
+    TRC_ASSERT(t != nullptr, "VulkanBuffer::set_tensor: 张量为空");
+    const size_t off = t->data_offset + offset;
+    if (mapped_ != nullptr) {
+        std::memcpy((uint8_t*) mapped_ + off, data, size);
+        return;
+    }
+    staging_upload(buffer_, off, data, size);
 }
 
 void VulkanBuffer::get_tensor(const Tensor* t, size_t offset, void* data, size_t size) const {
-    TRC_ASSERT(t != nullptr && t->data != nullptr, "VulkanBuffer::get_tensor: 张量数据为空");
-    std::memcpy(data, (const uint8_t*) t->data + offset, size);
+    TRC_ASSERT(t != nullptr, "VulkanBuffer::get_tensor: 张量为空");
+    const size_t off = t->data_offset + offset;
+    if (mapped_ != nullptr) {
+        std::memcpy(data, (const uint8_t*) mapped_ + off, size);
+        return;
+    }
+    staging_download(buffer_, off, data, size);
 }
 
-void VulkanBuffer::clear() { std::memset(mapped_, 0, size_); }
+void VulkanBuffer::clear() {
+    if (mapped_ != nullptr) {
+        std::memset(mapped_, 0, size_);
+        return;
+    }
+    staging_fill(buffer_, 0, size_, 0);
+}
 
 size_t VulkanBufferType::alignment() const {
     const size_t a = (size_t) vulkan_state().min_storage_offset_align;
@@ -946,9 +1242,10 @@ VulkanTensorBinding vulkan_bind_tensor(const Tensor* t) {
     TRC_ASSERT(buf != nullptr, "Vulkan 后端：张量 %s 尚未绑定 buffer", t->name);
 
     const size_t elem   = type_size(t->type);
-    const size_t offset = (size_t) ((const uint8_t*) t->data - (const uint8_t*) buf->base());
+    // M4.4：descriptor 偏移直接取 data_offset（绝对，缓冲内字节；不可映射缓冲无 data 指针）
+    const size_t offset = t->data_offset;
     // 注意：不能用 tensor_nbytes —— 它假设 nb[0]=type_size，对转置等视图会低估跨度
-    // （与核心 tensor_last_element_offset 的越界检查同思路）
+    // （与核心 tensor_last_element_offset 的越界检查同思路，见 AGENTS.md 已知坑）
     const size_t bytes = (size_t) (t->ne[0] - 1) * t->nb[0] + (size_t) (t->ne[1] - 1) * t->nb[1] +
                          (size_t) (t->ne[2] - 1) * t->nb[2] + (size_t) (t->ne[3] - 1) * t->nb[3] +
                          elem;

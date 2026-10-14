@@ -6,6 +6,7 @@
 #include "traincpp/traincpp.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 using namespace traincpp;
@@ -56,7 +57,9 @@ TRC_TEST(vulkan_buffer_roundtrip) {
 
     Buffer* buf = buffer_alloc_ctx_tensors(ctx, dev->default_buffer_type());
     TRC_EXPECT(buf != nullptr);
-    TRC_EXPECT(buf->is_host());  // M1.4 采用 host-visible 缓冲：核心视图读写依赖此语义
+    // 默认 host-visible（is_host=true）；M4.4b 强制 staging 时缓冲不可映射（is_host=false）
+    const bool force_staging = std::getenv("TRC_VK_FORCE_STAGING") != nullptr;
+    TRC_EXPECT(force_staging || buf->is_host());
     TRC_EXPECT(buf->size() > 0);
 
     // F32 往返
@@ -71,7 +74,7 @@ TRC_TEST(vulkan_buffer_roundtrip) {
         TRC_EXPECT_NEAR(got[i], vals[i], 0.0);
     }
 
-    // 视图直读：视图未绑定 buffer，走主机直读；必须与源内存一致
+    // 视图读取：视图沿 view_src 找到根的 buffer（含不可映射，经 staging/M4.4 契约）
     std::vector<float> vgot(8, -1.0f);
     tensor_get(view, vgot.data(), 0, vgot.size() * sizeof(float));
     for (int i = 0; i < 8; ++i) {

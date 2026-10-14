@@ -40,13 +40,12 @@ public:
     bool is_host() const override { return true; }
 
     void set_tensor(Tensor* t, size_t offset, const void* data, size_t size) override {
-        TRC_ASSERT(t->data != nullptr, "CpuBuffer::set_tensor: 张量未分配数据");
-        std::memcpy((uint8_t*) t->data + offset, data, size);
+        // M4.4：按 data_offset 定位（视图也传入本 buffer；data 可能为空）
+        std::memcpy(data_ + t->data_offset + offset, data, size);
     }
 
     void get_tensor(const Tensor* t, size_t offset, void* data, size_t size) const override {
-        TRC_ASSERT(t->data != nullptr, "CpuBuffer::get_tensor: 张量未分配数据");
-        std::memcpy(data, (const uint8_t*) t->data + offset, size);
+        std::memcpy(data, data_ + t->data_offset + offset, size);
     }
 
     void clear() override { std::memset(data_, 0, size_); }

@@ -54,7 +54,8 @@ struct Tensor {
     Tensor* view_src  = nullptr;  // 视图的源张量
     size_t  view_offs = 0;        // 视图在源张量中的字节偏移
 
-    void* data = nullptr;  // 张量数据（可能为 nullptr：no_alloc 模式）
+    void* data = nullptr;        // 张量主机数据指针（可能为 nullptr：no_alloc 模式或不可映射的 device-local buffer）
+    size_t data_offset = 0;      // 张量首元素在所属 buffer 内的字节偏移（视图 = 源偏移 + view_offs；无 buffer 时为 0）
 
     char name[MAX_NAME] = {0};
 

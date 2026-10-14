@@ -12,7 +12,8 @@ namespace traincpp {
 namespace {
 
 bool fill_ready(const Tensor* t) {
-    return t->data != nullptr;
+    // M4.4c：有 buffer（含不可映射 device-local）即视为可填充——经 tensor_set 路由到设备/staging
+    return t->data != nullptr || t->buffer != nullptr;
 }
 
 void check_fill_target(const Tensor* t) {

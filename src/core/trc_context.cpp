@@ -313,8 +313,9 @@ size_t context_release_graph_tensors(Context* ctx, Graph* graph) {
 
     // 3) 清数据指针（下次分配不再包含这些张量）
     for (Tensor* t : release) {
-        t->buffer = nullptr;
-        t->data   = nullptr;
+        t->buffer      = nullptr;
+        t->data        = nullptr;
+        t->data_offset = 0;
     }
 
     // 4) 从 registry 移除（其余张量相对顺序不变：视图源仍先于视图）

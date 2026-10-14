@@ -64,9 +64,12 @@ TRC_TEST(alloc_free_realloc) {
     TRC_EXPECT(buf1 != nullptr);
 
     check_forward(dev, g, a, b, c);
-    TRC_EXPECT(a->data != nullptr);
-    TRC_EXPECT(m->data != nullptr);
-    TRC_EXPECT(v->data == (uint8_t*) m->data + v->view_offs);
+    TRC_EXPECT(a->buffer != nullptr);
+    TRC_EXPECT(m->buffer != nullptr);
+    if (m->data != nullptr) {
+        TRC_EXPECT(v->data == (uint8_t*) m->data + v->view_offs);
+    }
+    TRC_EXPECT(v->data_offset == m->data_offset + v->view_offs);
 
     buffer_free(buf1);
 
@@ -89,13 +92,64 @@ TRC_TEST(alloc_free_realloc) {
     TRC_EXPECT(b->buffer == buf2);
     TRC_EXPECT(c->buffer == buf2);
     TRC_EXPECT(m->buffer == buf2);
-    TRC_EXPECT(a->data != nullptr);
-    TRC_EXPECT(c->data != nullptr);
-    TRC_EXPECT(v->data == (uint8_t*) m->data + v->view_offs);
+    TRC_EXPECT(a->buffer == buf2);
+    TRC_EXPECT(c->buffer == buf2);
+    if (m->data != nullptr) {
+        TRC_EXPECT(v->data == (uint8_t*) m->data + v->view_offs);
+    }
+    TRC_EXPECT(v->data_offset == m->data_offset + v->view_offs);
 
     if (check_forward(dev, g, a, b, c)) {
         TRC_EXPECT(read_f32(c)[0] == 11.0f);
     }
+
+    graph_free(g);
+    buffer_free(buf2);
+    context_free(ctx);
+}
+
+// M4.4a：data_offset 契约——root 为放置偏移，view = 源 data_offset + view_offs；
+// 与 data 指针是否可解引用无关（不可映射缓冲下 data 可为空但 offset 有效）。
+TRC_TEST(alloc_data_offset_root_view) {
+    Device* dev = trc_test::test_device();
+    if (dev == nullptr) {
+        std::printf("    跳过：TRC_TEST_DEVICE 指定的设备不可用\n");
+        return;
+    }
+
+    Context* ctx = context_new(1 << 20);
+    Graph*   g   = graph_new(ctx);
+
+    Tensor* m  = new_tensor_1d(ctx, TYPE_F32, 8);              // 唯一非视图：放置偏移 0
+    Tensor* v  = view_1d(ctx, m, 6, sizeof(float) * 2);        // 视图：偏移 +8 字节
+    Tensor* v2 = view_1d(ctx, v, 4, sizeof(float) * 1);        // 视图的视图：再 +4 字节
+    Tensor* o  = add(ctx, v2, v2);                             // 消费视图，保证图覆盖
+    graph_build_forward_expand(ctx, g, o);
+
+    Buffer* buf = buffer_alloc_ctx_tensors(ctx, dev->default_buffer_type());
+    TRC_EXPECT(buf != nullptr);
+
+    TRC_EXPECT(m->data_offset == 0);
+    TRC_EXPECT(v->view_offs == sizeof(float) * 2);
+    TRC_EXPECT(v->data_offset == m->data_offset + v->view_offs);
+    TRC_EXPECT(v2->data_offset == v->data_offset + v2->view_offs);  // 链式累加
+    if (m->data != nullptr) {
+        TRC_EXPECT((uint8_t*) m->data + m->data_offset == (uint8_t*) buf->base());
+        TRC_EXPECT(v->data == (uint8_t*) m->data + v->view_offs);
+        TRC_EXPECT(v2->data == (uint8_t*) v->data + v2->view_offs);
+    }
+
+    // 重新分配后偏移关系必须保持不变
+    buffer_free(buf);
+    TRC_EXPECT(m->data_offset == 0);
+    TRC_EXPECT(v->data_offset == 0);
+    TRC_EXPECT(v2->data_offset == 0);
+
+    Buffer* buf2 = buffer_alloc_ctx_tensors(ctx, dev->default_buffer_type());
+    TRC_EXPECT(buf2 != nullptr);
+    TRC_EXPECT(m->data_offset == 0);
+    TRC_EXPECT(v->data_offset == v->view_offs);
+    TRC_EXPECT(v2->data_offset == v->data_offset + v2->view_offs);
 
     graph_free(g);
     buffer_free(buf2);
@@ -592,14 +646,13 @@ TRC_TEST(free_scoped_to_own_buffer) {
 
     TRC_EXPECT(t1->data == nullptr);
     TRC_EXPECT(t1->buffer == nullptr);
-    TRC_EXPECT(t2->data != nullptr);
     TRC_EXPECT(t2->buffer == buf2);
 
     const std::vector<float> got = read_f32(t2);
     TRC_EXPECT(got.size() == 4 && got[0] == 5.0f && got[3] == 8.0f);
 
     buffer_free(nullptr);
-    TRC_EXPECT(t2->data != nullptr);  // 空指针 free 不得误伤其他 buffer
+    TRC_EXPECT(t2->buffer == buf2);  // 空指针 free 不得误伤其他 buffer
 
     buffer_free(buf2);
     context_free(ctx1);

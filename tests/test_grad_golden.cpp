@@ -254,7 +254,8 @@ bool compare_f32(const Tensor* t, const std::string& path, std::string& err) {
     int64_t n_bad   = 0;
     for (int64_t i = 0; i < n; ++i) {
         const size_t off = tensor_offset_linear(t, i);
-        const float  got = *(const float*) ((const uint8_t*) t->data + off);
+        float        got = 0.0f;
+        tensor_get(t, &got, off, sizeof(float));  // M4.4d：经 buffer/staging，兼容不可映射
         const float  exp = ((const float*) want.raw.data())[(size_t) i];
         const double diff = std::fabs((double) got - exp);
         const double tol  = 1e-4 + 1e-3 * std::fabs((double) exp);
@@ -269,7 +270,8 @@ bool compare_f32(const Tensor* t, const std::string& path, std::string& err) {
     if (n_bad != 0) {
         char buf[512];
         const size_t off   = tensor_offset_linear(t, max_idx);
-        const float  got_v = *(const float*) ((const uint8_t*) t->data + off);
+        float        got_v = 0.0f;
+        tensor_get(t, &got_v, off, sizeof(float));  // M4.4d：经 buffer/staging
         const float  exp_v = ((const float*) want.raw.data())[(size_t) max_idx];
         std::snprintf(buf, sizeof(buf),
                       "%s: 超差 %lld/%lld 元素, 最大绝对差 %.3g (下标 %lld: 实际 %.6g 期望 %.6g)",

@@ -166,6 +166,47 @@ if(TRC_VULKAN)
     set_tests_properties(alloc_vulkan_device_local PROPERTIES
                          ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_DEVICE_LOCAL=1")
 
+    # M4.4b：强制 staging（不可映射 device-local + 同步 staging）覆盖变体。
+    # 覆盖已迁移的主机路径（初始化/优化器状态/IO）；grad clip/nn WeightNorm 留 M4.5，暂不纳入。
+    add_test(NAME staging_alloc COMMAND test_alloc)
+    set_tests_properties(staging_alloc PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_vulkan COMMAND test_vulkan)
+    set_tests_properties(staging_vulkan PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_conformance COMMAND test_backend_conformance)
+    set_tests_properties(staging_conformance PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_train_trace COMMAND test_train_trace)
+    set_tests_properties(staging_train_trace PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_gan COMMAND test_gan)
+    set_tests_properties(staging_gan PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_gguf COMMAND test_gguf)
+    set_tests_properties(staging_gguf PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    # M4.4d：golden/grad_golden（测试经 tensor_get 读取）+ checkpoint（状态守卫按 storage 判定）
+    add_test(NAME staging_golden COMMAND test_golden)
+    set_tests_properties(staging_golden PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_grad_golden COMMAND test_grad_golden)
+    set_tests_properties(staging_grad_golden PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_checkpoint COMMAND test_checkpoint)
+    set_tests_properties(staging_checkpoint PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    # M4.5f：迁移完成后，optim（设备裁剪）/nn（WeightNorm 同步）/acceptance 也可在不可映射下跑通
+    add_test(NAME staging_optim COMMAND test_optim)
+    set_tests_properties(staging_optim PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_nn COMMAND test_nn)
+    set_tests_properties(staging_nn PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+    add_test(NAME staging_acceptance COMMAND test_acceptance)
+    set_tests_properties(staging_acceptance PROPERTIES
+                         ENVIRONMENT "TRC_TEST_DEVICE=vulkan;TRC_VK_FORCE_STAGING=1")
+
     # 规模压力套件在 Vulkan 上复跑（M2.2d；默认小档）
     add_test(NAME stress_vulkan COMMAND test_stress)
     set_tests_properties(stress_vulkan PROPERTIES ENVIRONMENT "TRC_TEST_DEVICE=vulkan")

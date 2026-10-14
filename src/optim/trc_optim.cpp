@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS  // getenv 用于可选环境变量，无需 MSVC 安全版本
 // train.cpp - 优化器与学习率调度实现（主机端，后端无关）
 //
 // 数值语义：与 PyTorch torch.optim.SGD / torch.optim.AdamW 逐条对齐（见 trc_optim.h）；
@@ -8,8 +9,10 @@
 #include "core/trc_impl.h"
 #include "traincpp/trc_backend.h"
 #include "traincpp/trc_context.h"
+#include "traincpp/trc_ops.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <vector>
@@ -60,12 +63,6 @@ void resize_or_abort(std::vector<float>& v, size_t n, const char* what) {
     }
 }
 
-void fill_f32(Tensor* t, float value) {
-    const size_t n = (size_t) tensor_nelements(t);
-    float*       p = data_mut(t);
-    std::fill(p, p + n, value);
-}
-
 // 参数梯度（反向展开后 t->grad 指向梯度累加器）
 const Tensor* param_grad(const Tensor* p) {
     return p->grad != nullptr ? p->grad : p->grad_acc;
@@ -87,6 +84,19 @@ struct Optimizer {
     // R13：热路径可复用主机 scratch（按最大参数长度增长一次，之后不再分配）
     std::vector<float> scratch_grad;  // SGD weight_decay 临时梯度
     std::vector<float> scratch_dir;   // SGD Nesterov 临时方向
+
+    // M4.3：设备端优化器图（透明分派）。仅当所有参数/梯度/状态同属一个非 CPU 后端设备时使用；
+    // nodes = 每参数一个 OP_OPT_STEP_*（param 的完整视图），每步更新其 op_params 标量后一次 compute。
+    Graph* device_graph = nullptr;
+    bool   device_dirty = true;  // 增删参数组后需重建
+    bool   path_logged  = false; // M4.3：首次选择路径时打印一次（供集成侧确认）
+
+    // M4.5c：设备端梯度裁剪图（累积 acc[0] += Σ g² → 就地缩放每个梯度）
+    Graph*               clip_graph       = nullptr;
+    bool                 clip_dirty       = true;   // 增删参数组后需重建
+    bool                 clip_logged      = false;  // 首次走设备裁剪时打印一次
+    Tensor*              clip_acc         = nullptr;  // 1 元素 F32 累积器（设备标量）
+    std::vector<Tensor*> clip_scale_nodes;           // 需每步刷新 op_params 的缩放节点
 
     int64_t step_count = 0;
 };
@@ -141,9 +151,9 @@ void alloc_states_block(Optimizer* opt, size_t from) {
                       "请减小模型或换设备",
                       total, (double) total / (1024.0 * 1024.0), props.name.c_str());
         }
-        base = (uint8_t*) buf->base();
-        TRC_ASSERT(base != nullptr, "优化器状态缓冲区无主机指针（M1.4 语义要求 host-visible）");
-        std::memset(base, 0, total);
+        // M4.4c：清零走 Buffer::clear（host-visible 直接 memset；不可映射 device-local 走设备 fill）
+        buf->clear();
+        base = (uint8_t*) buf->base();  // 不可映射时为 nullptr（状态经 data_offset 定位）
         opt->state_buffers.push_back(buf);
         backend_note_buffer_alloc(buf, buf->size());  // M2.2a：核心分配统计（optim_free 经 buffer_free 扣减）
     } else {
@@ -160,9 +170,10 @@ void alloc_states_block(Optimizer* opt, size_t from) {
     size_t offset = 0;
     for (size_t i = from; i < opt->state_tensors.size(); ++i) {
         Tensor* t = opt->state_tensors[i];
-        offset    = align_up(offset, MEM_ALIGN);
-        t->buffer = buf;  // 主机内存情形保持 nullptr
-        t->data   = base + offset;
+        offset         = align_up(offset, MEM_ALIGN);
+        t->buffer      = buf;  // 主机内存情形保持 nullptr
+        t->data_offset = buf != nullptr ? offset : 0;  // 无 buffer（主机块）时偏移无意义
+        t->data        = base != nullptr ? base + offset : nullptr;  // device-local 无主机指针
         offset += tensor_nbytes(t);
     }
 }
@@ -205,14 +216,22 @@ void add_group(Optimizer* opt, OptimKind kind, const SgdOptions& sgd, const Adam
 
     // 动态加组（M2.1h / R11）：若已有状态张量已分配数据（已 step / 已 alloc / 已被 ctx 分配），
     // 立即为新组分配独立状态块；否则留给首次 step 的 ensure_states 统一分配。
-    if (first_new_state > 0 && opt->state_tensors[first_new_state - 1]->data != nullptr) {
+    Tensor* last = first_new_state > 0 ? opt->state_tensors[first_new_state - 1] : nullptr;
+    if (last != nullptr && (last->data != nullptr || last->buffer != nullptr)) {
         alloc_states_block(opt, first_new_state);
     }
+
+    opt->device_dirty = true;  // M4.3：参数组变化后设备优化器图需重建
+    opt->clip_dirty   = true;  // M4.5c：参数组变化后设备裁剪图需重建
 }
 
 // 首次 step 时分配全部状态（优先使用参数所在后端的 BufferType，CPU/Vulkan 通用）
 void ensure_states(Optimizer* opt) {
-    if (opt->state_tensors.empty() || opt->state_tensors[0]->data != nullptr) {
+    if (opt->state_tensors.empty()) {
+        return;
+    }
+    Tensor* first = opt->state_tensors[0];
+    if (first->data != nullptr || first->buffer != nullptr) {
         return;
     }
     alloc_states_block(opt, 0);
@@ -312,6 +331,190 @@ void adamw_update(ParamGroup& group, Optimizer* opt) {
     }
 }
 
+// ---------------------------------------------------------------- 设备端优化器（M4.3）
+
+// 判定是否可用设备端路径：所有 param/梯度/状态张量都已由同一非 CPU 后端设备分配。
+// 返回该设备；返回 nullptr 表示走主机路径（CPU、混合设备、或参数尚未分配）。
+Device* optimizer_device(const Optimizer* opt) {
+    Device* dev = nullptr;
+    auto    check = [&](const Tensor* t) -> bool {
+        if (t == nullptr || t->buffer == nullptr) {
+            return false;
+        }
+        Device* d = t->buffer->buffer_type()->device();
+        if (d == nullptr || d->props().type == DeviceType::CPU) {
+            return false;
+        }
+        if (dev == nullptr) {
+            dev = d;
+        }
+        return dev == d;
+    };
+    for (const ParamGroup& g : opt->groups) {
+        for (const OptimState& st : g.states) {
+            if (!check(st.param) || !check(param_grad(st.param)) || !check(st.mom)) {
+                return nullptr;
+            }
+            if (g.kind == OptimKind::ADAMW && !check(st.vel)) {
+                return nullptr;
+            }
+        }
+    }
+    return dev;
+}
+
+// 构建设备优化器图（一次；每参数一个 OP_OPT_STEP_* 节点，结果为 param 的完整视图）。
+// 节点顺序与 groups/states 展开顺序一致，device_step 按同序写 op_params。
+void build_device_graph(Optimizer* opt) {
+    if (opt->device_graph != nullptr) {
+        graph_free(opt->device_graph);
+        opt->device_graph = nullptr;
+    }
+    Graph* g = graph_new(opt->ctx);
+    for (ParamGroup& group : opt->groups) {
+        for (OptimState& st : group.states) {
+            Tensor* grad = const_cast<Tensor*>(param_grad(st.param));
+            Tensor* node =
+                (group.kind == OptimKind::SGD)
+                    ? opt_step_sgd(opt->ctx, st.param, grad, st.mom, 0.0f, 0.0f, 0.0f, 0.0f,
+                                   false, true)
+                    : opt_step_adamw(opt->ctx, st.param, grad, st.mom, st.vel, 0.0f, 1.0f, 1.0f,
+                                     0.0f, 0.0f, 0.0f);
+            g->nodes.push_back(node);
+        }
+    }
+    opt->device_graph = g;
+    opt->device_dirty = false;
+}
+
+// 设备路径执行一步：主机算好每参数标量（与 sgd_update/adamw_update 逐条对齐），写入节点的
+// op_params，再一次 graph_compute 完成全部参数更新；步数计数与主机路径一致。
+void device_step(Optimizer* opt, Device* dev) {
+    TRC_ASSERT(opt->device_graph != nullptr, "设备优化器：图未构建");
+    std::vector<OptimState*> sgd_states;  // SGD：compute 后才 ++step（与主机 update 末尾一致）
+    size_t                   idx = 0;
+    for (ParamGroup& group : opt->groups) {
+        for (OptimState& st : group.states) {
+            TRC_ASSERT(idx < opt->device_graph->nodes.size(), "设备优化器：节点数不匹配");
+            Tensor* node = opt->device_graph->nodes[idx++];
+            // 节点是 param 的完整视图（offset=0），但在 buffer 分配之后创建（no_alloc 路径下
+            // 视图 data/data_offset 不会自动解析）——每次刷新，兼容缓冲重分配后的变化（M4.3/M4.4）
+            node->data        = st.param->data;
+            node->data_offset = st.param->data_offset;
+            float   s[6];
+            if (group.kind == OptimKind::SGD) {
+                const SgdOptions& o = group.sgd;
+                s[0] = o.lr;
+                s[1] = o.momentum;
+                s[2] = o.dampening;
+                s[3] = o.weight_decay;
+                s[4] = o.nesterov ? 1.0f : 0.0f;
+                s[5] = (st.step == 0) ? 1.0f : 0.0f;
+                sgd_states.push_back(&st);
+            } else {
+                const AdamwOptions& o = group.adamw;
+                ++st.step;  // 主机 adamw_update 在计算 bias correction 前自增
+                const double bc1 = 1.0 - std::pow((double) o.beta1, (double) st.step);
+                const double bc2 = 1.0 - std::pow((double) o.beta2, (double) st.step);
+                s[0] = (float) ((double) o.lr / bc1);
+                s[1] = (float) std::sqrt(bc2);
+                s[2] = 1.0f - o.lr * o.weight_decay;
+                s[3] = o.beta1;
+                s[4] = o.beta2;
+                s[5] = o.eps;
+            }
+            std::memcpy(node->op_params, s, sizeof(s));
+        }
+    }
+    dev->graph_compute(opt->device_graph);
+    for (OptimState* st : sgd_states) {
+        ++st->step;
+    }
+}
+
+// ---------------------------------------------------------------- 设备端梯度裁剪（M4.5c）
+
+// 1 元素 F32 累积器（设备标量）；分配一块专用小 buffer，随 optim_free 释放
+Tensor* ensure_clip_acc(Optimizer* opt, Device* dev) {
+    if (opt->clip_acc != nullptr) {
+        return opt->clip_acc;
+    }
+    BufferType* buft = dev->default_buffer_type();
+    Buffer*     buf  = buft->alloc_buffer(sizeof(float));
+    TRC_ASSERT(buf != nullptr, "optim_clip_grad_norm: 设备标量缓冲分配失败（需要 %zu 字节）",
+               sizeof(float));
+    Tensor* t = new_tensor_1d(opt->ctx, TYPE_F32, 1);
+    tensor_set_name(t, "clip_grad_norm.acc");
+    t->buffer      = buf;
+    t->data_offset = 0;
+    t->data        = (uint8_t*) buf->base();  // 不可映射时为 nullptr（经 staging/data_offset 定位）
+    opt->clip_acc  = t;
+    opt->state_buffers.push_back(buf);  // 与状态块一同释放
+    backend_note_buffer_alloc(buf, buf->size());  // 核心路径分配统计（buffer_free 扣减）
+    return t;
+}
+
+// 构建裁剪图：先每梯度一个 SUM_SQR_ACC 累积，再每梯度一个 CLIP_SCALE_INPLACE 就地缩放
+// （图节点按序执行，全部累积完成后再统一缩放；均为视图/副作用节点，无需额外存储）
+void build_clip_graph(Optimizer* opt) {
+    if (opt->clip_graph != nullptr) {
+        graph_free(opt->clip_graph);
+        opt->clip_graph = nullptr;
+    }
+    opt->clip_scale_nodes.clear();
+
+    Graph* g = graph_new(opt->ctx);
+    for (ParamGroup& group : opt->groups) {
+        for (OptimState& st : group.states) {
+            Tensor* grad = const_cast<Tensor*>(param_grad(st.param));
+            TRC_ASSERT(grad != nullptr, "optim_clip_grad_norm: 参数 %s 没有梯度", st.param->name);
+            g->nodes.push_back(sum_sqr_acc(opt->ctx, opt->clip_acc, grad));
+        }
+    }
+    for (ParamGroup& group : opt->groups) {
+        for (OptimState& st : group.states) {
+            Tensor* grad = const_cast<Tensor*>(param_grad(st.param));
+            Tensor* node = clip_scale_inplace(opt->ctx, grad, opt->clip_acc, 0.0f, 1e-6f);
+            opt->clip_scale_nodes.push_back(node);
+            g->nodes.push_back(node);
+        }
+    }
+    opt->clip_graph = g;
+    opt->clip_dirty = false;
+}
+
+// 设备路径：清零累积器 → 一次 compute（累积 + 缩放）→ 读回总范数（仅 4 字节同步转移）
+float device_clip_grad_norm(Optimizer* opt, Device* dev, float max_norm) {
+    ensure_clip_acc(opt, dev);
+    if (opt->clip_graph == nullptr || opt->clip_dirty) {
+        build_clip_graph(opt);
+    }
+    // 每步刷新视图 data/data_offset（buffer 可能重分配；no_alloc 路径不自动解析视图）
+    for (Tensor* node : opt->clip_graph->nodes) {
+        Tensor* base      = node->src[0];  // SUM_SQR_ACC → acc；CLIP_SCALE_INPLACE → grad
+        node->data        = base->data;
+        node->data_offset = base->data_offset;
+    }
+    // 写缩放节点的 op_params（max_norm 每次调用可能不同；eps 与主机一致取 1e-6）
+    for (Tensor* node : opt->clip_scale_nodes) {
+        const float params[2] = {max_norm, 1e-6f};
+        std::memcpy(node->op_params, params, sizeof(params));
+    }
+
+    if (!opt->clip_logged) {
+        TRC_LOG_INFO("梯度裁剪：使用设备端 kernel [%s]，%lld 参数", dev->props().name.c_str(),
+                     (long long) optim_param_count(opt));
+        opt->clip_logged = true;
+    }
+    const bool ok = dev->fill_tensor(opt->clip_acc, 0.0f);
+    TRC_ASSERT(ok, "optim_clip_grad_norm: 设备清零累积器失败");
+    dev->graph_compute(opt->clip_graph);
+
+    float sum_sq = 0.0f;
+    tensor_get(opt->clip_acc, &sum_sq, 0, sizeof(sum_sq));
+    return std::sqrt(sum_sq);
+}
+
 } // namespace
 
 enum class LrScheduleKind {
@@ -362,10 +565,27 @@ void optim_free(Optimizer* opt) {
     if (opt == nullptr) {
         return;
     }
+    // M4.3：释放设备优化器图（节点为 param 视图，不拥有数据）
+    if (opt->device_graph != nullptr) {
+        graph_free(opt->device_graph);
+        opt->device_graph = nullptr;
+    }
+    // M4.5c：释放设备裁剪图与累积器（累积器 buffer 在 state_buffers 中统一释放）
+    if (opt->clip_graph != nullptr) {
+        graph_free(opt->clip_graph);
+        opt->clip_graph = nullptr;
+    }
+    if (opt->clip_acc != nullptr) {
+        opt->clip_acc->buffer      = nullptr;
+        opt->clip_acc->data        = nullptr;
+        opt->clip_acc->data_offset = 0;
+        opt->clip_acc = nullptr;
+    }
     // 状态张量存活于 ctx：清空其数据指针，避免 free 后悬挂
     for (Tensor* t : opt->state_tensors) {
-        t->buffer = nullptr;
-        t->data   = nullptr;
+        t->buffer      = nullptr;
+        t->data        = nullptr;
+        t->data_offset = 0;
     }
     for (Buffer* b : opt->state_buffers) {
         buffer_free(b);
@@ -541,25 +761,51 @@ int64_t optim_step_count(const Optimizer* opt) {
 }
 
 void optim_zero_grad(Optimizer* opt) {
+    // M4.2：设备张量的梯度清零走设备 fill（一次提交），不再主机逐元素扫描
+    std::vector<TensorFill> fills;
     for (const ParamGroup& g : opt->groups) {
         for (const OptimState& st : g.states) {
             if (st.param->grad_acc != nullptr) {
-                fill_f32(st.param->grad_acc, 0.0f);
+                fills.push_back({st.param->grad_acc, 0.0f});
             } else if (st.param->grad != nullptr) {
-                fill_f32(st.param->grad, 0.0f);
+                fills.push_back({st.param->grad, 0.0f});
             }
         }
+    }
+    if (!fills.empty()) {
+        tensor_fill_values(fills.data(), fills.size());
     }
 }
 
 void optim_step(Optimizer* opt) {
     TRC_ASSERT(opt != nullptr, "optim_step: 优化器为空");
     ensure_states(opt);
-    for (ParamGroup& g : opt->groups) {
-        if (g.kind == OptimKind::SGD) {
-            sgd_update(g, opt);
-        } else {
-            adamw_update(g, opt);
+
+    // M4.3：透明自动分派——参数/梯度/状态同属一个非 CPU 后端设备时走设备端 kernel，
+    // 否则回落主机实现。TRC_OPT_HOST=1 可强制主机路径（A/B 基线）。
+    const char* host_env  = std::getenv("TRC_OPT_HOST");
+    const bool  force_host = host_env != nullptr && *host_env != '\0';
+    Device*     dev        = force_host ? nullptr : optimizer_device(opt);
+
+    if (dev != nullptr) {
+        if (opt->device_dirty || opt->device_graph == nullptr) {
+            build_device_graph(opt);
+            TRC_LOG_INFO("优化器：使用设备端 kernel [%s]，%lld 参数", dev->props().name.c_str(),
+                         (long long) optim_param_count(opt));
+        }
+        device_step(opt, dev);
+    } else {
+        if (!opt->path_logged) {
+            TRC_LOG_INFO("优化器：使用主机路径 [%s]",
+                         force_host ? "TRC_OPT_HOST=1" : "not-single-device");
+            opt->path_logged = true;
+        }
+        for (ParamGroup& g : opt->groups) {
+            if (g.kind == OptimKind::SGD) {
+                sgd_update(g, opt);
+            } else {
+                adamw_update(g, opt);
+            }
         }
     }
     ++opt->step_count;
@@ -567,6 +813,16 @@ void optim_step(Optimizer* opt) {
 
 float optim_clip_grad_norm(Optimizer* opt, float max_norm) {
     TRC_ASSERT(opt != nullptr, "optim_clip_grad_norm: 优化器为空");
+    ensure_states(opt);
+
+    // M4.5c：透明设备分派——参数/梯度/状态同属一个非 CPU 后端设备时走设备端 kernel（累积 + 就地缩放），
+    // 否则回落主机实现。TRC_OPT_HOST=1 可强制主机路径（A/B 基线）。
+    const char* host_env  = std::getenv("TRC_OPT_HOST");
+    const bool  force_host = host_env != nullptr && *host_env != '\0';
+    Device*     dev        = force_host ? nullptr : optimizer_device(opt);
+    if (dev != nullptr) {
+        return device_clip_grad_norm(opt, dev, max_norm);
+    }
 
     // R13：直接读/写主机数据（逐元素运算顺序不变）
     double sum_sq = 0.0;
