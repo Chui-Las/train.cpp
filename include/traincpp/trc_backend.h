@@ -57,6 +57,12 @@ public:
     virtual void clear() = 0;
 };
 
+// 批量填充请求（M4.2）：把张量填成指定 F32 值（张量需连续 F32）
+struct TensorFill {
+    Tensor* tensor = nullptr;
+    float   value  = 0.0f;
+};
+
 // 设备：后端对外的统一句柄
 class Device {
 public:
@@ -71,6 +77,14 @@ public:
 
     // 执行计算图（异步语义由后端自行决定，一期均为同步）
     virtual bool graph_compute(Graph* graph) = 0;
+
+    // 批量填充若干 F32 连续张量（M4.2）：默认逐张量主机填充；设备后端可合并为单次提交。
+    // 用于梯度清零（graph_reset / optim_zero_grad），避免主机扫描模型规模缓冲。
+    virtual bool fill_tensors(const TensorFill* fills, size_t count);
+    bool fill_tensor(Tensor* t, float value) {
+        TensorFill f{t, value};
+        return fill_tensors(&f, 1);
+    }
 };
 
 // 整图 pre-flight：返回第一个当前设备不支持的节点（nullptr = 全部支持）。

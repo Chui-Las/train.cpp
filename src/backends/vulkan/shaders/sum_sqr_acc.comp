@@ -1,0 +1,36 @@
+#version 450
+// train.cpp - Vulkan 梯度平方和累积 kernel（M4.5；acc[0] += Σ a²）
+// 单 workgroup：先归约本张量平方和，再就地累加进 acc（binding 1 = node，acc 的完整视图）。
+// 图节点按序执行，跨多个梯度张量顺序累积无竞态。a 需连续 F32（扁平索引）。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint base_a;
+    uint base_acc;
+    uint numel;
+} pc;
+
+layout(std430, binding = 0) readonly buffer A { float data_a[]; };
+layout(std430, binding = 1) buffer Acc { float data_acc[]; };
+
+shared float sdata[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    for (uint i = tid; i < pc.numel; i += 256u) {
+        const float x = data_a[pc.base_a + i];
+        acc += x * x;
+    }
+    sdata[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        data_acc[pc.base_acc] += sdata[0];
+    }
+}

@@ -723,6 +723,19 @@ void check_weightnorm_shapes(const Tensor* v, const Tensor* g, const char* what)
     }
 }
 
+// M4.5d：v/g 同属一个非 CPU 后端设备时返回该设备（否则走主机路径）
+Device* weightnorm_device(const Tensor* v, const Tensor* g) {
+    if (v == nullptr || g == nullptr || v->buffer == nullptr || g->buffer == nullptr) {
+        return nullptr;
+    }
+    Device* dv = v->buffer->buffer_type()->device();
+    Device* dg = g->buffer->buffer_type()->device();
+    if (dv == nullptr || dv != dg || dv->props().type == DeviceType::CPU) {
+        return nullptr;
+    }
+    return dv;
+}
+
 } // namespace
 
 void weightnorm_init(Context* ctx, WeightNorm* wn, Tensor* v, Tensor* g, const char* name) {
@@ -733,6 +746,7 @@ void weightnorm_init(Context* ctx, WeightNorm* wn, Tensor* v, Tensor* g, const c
     check_weightnorm_shapes(v, g, "weightnorm_init");
 
     set_layer_name(wn->name, name, "weightnorm");
+    wn->ctx = ctx;
     wn->v = v;
     wn->g = g;
     set_param_name(v, wn->name, "weight_v");
@@ -784,6 +798,28 @@ void weightnorm_sync_g(const WeightNorm* wn) {
     check_param(v, "weightnorm_sync_g: v");
     check_param(g, "weightnorm_sync_g: g");
     check_weightnorm_shapes(v, g, "weightnorm_sync_g");
+
+    // M4.5d：透明设备分派——v/g 同属一个非 CPU 后端设备时走设备端 kernel（就地写 g），
+    // 否则回落主机实现（要求 v/g 有可解引用主机数据）。避免不可映射 device-local 下主机直读 v。
+    Device* dev = weightnorm_device(v, g);
+    if (dev != nullptr && wn->ctx != nullptr) {
+        WeightNorm* mwn = const_cast<WeightNorm*>(wn);
+        if (mwn->dev_graph == nullptr || mwn->dev_node == nullptr) {
+            if (mwn->dev_graph != nullptr) {
+                graph_free(mwn->dev_graph);
+                mwn->dev_graph = nullptr;
+            }
+            mwn->dev_node  = weightnorm_sync(mwn->ctx, const_cast<Tensor*>(v), g);
+            mwn->dev_graph = graph_new(mwn->ctx);
+            mwn->dev_graph->nodes.push_back(mwn->dev_node);
+        }
+        // 刷新视图偏移（buffer 可能重分配；no_alloc 路径不自动解析视图）
+        mwn->dev_node->data        = g->data;
+        mwn->dev_node->data_offset = g->data_offset;
+        dev->graph_compute(mwn->dev_graph);
+        return;
+    }
+
     TRC_ASSERT(v->data != nullptr && g->data != nullptr,
                "weightnorm_sync_g: v/g 无数据（需先 buffer_alloc_ctx_tensors）");
 

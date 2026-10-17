@@ -1,6 +1,6 @@
 // train.cpp - GGUF 读写实现（与 ggml v0.23.0 对齐，M1.6a）
 //
-// 参考 ggml v0.23.0 的 src/gguf.cpp、ggml-quants.c、ggml-common.h
+// 参考（只读）：ggml v0.23.0 的 src/gguf.cpp、ggml-quants.c、ggml-common.h
 // 生成端语义逐条对齐：头布局、KV 编码、tensor info、数据段对齐、类型 id、量化块布局。
 #define _CRT_SECURE_NO_WARNINGS
 

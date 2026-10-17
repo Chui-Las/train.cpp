@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(traincpp
-    VERSION 0.1.0
+    VERSION 0.4.0
     DESCRIPTION "通用 C++ 深度学习训练库（ggml 生态互操作）"
     LANGUAGES CXX)
 

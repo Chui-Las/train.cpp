@@ -1,0 +1,33 @@
+#version 450
+// train.cpp - Vulkan WeightNorm 同步 kernel（M4.5；g[oc] = sqrt(Σ_rest v²)）
+// v 连续 [n_rest, oc]，oc 为最后一维（最慢变），g 连续 [oc]；binding 0 = v（只读），1 = node（g 视图，写）。
+// 与 weightnorm_sync_g 的主机实现逐条一致（逐输出通道归一化分母）。
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint numel;   // = oc
+    uint n_rest;  // 非输出通道维元素数
+    uint base_v;
+    uint base_g;
+} pc;
+
+layout(std430, binding = 0) readonly buffer V { float data_v[]; };
+layout(std430, binding = 1) writeonly buffer G { float data_g[]; };
+
+void main() {
+    const uint stride = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint o = gl_GlobalInvocationID.x;
+    while (o < pc.numel) {
+        float acc = 0.0;
+        const uint vbase = pc.base_v + o * pc.n_rest;
+        for (uint r = 0; r < pc.n_rest; ++r) {
+            const float x = data_v[vbase + r];
+            acc += x * x;
+        }
+        data_g[pc.base_g + o] = sqrt(acc);
+        if (pc.numel - o <= stride) {
+            break;
+        }
+        o += stride;
+    }
+}

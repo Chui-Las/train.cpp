@@ -220,6 +220,13 @@ void check_gradients(NnFixture& f, const std::vector<Tensor*>& xs, Tensor* loss,
             const float lm = read_scalar(loss);
             const double numeric = ((double) lp - (double) lm) / (2.0 * eps);
             const double ana = analytic[(size_t) i];
+            // 失败细节（定位 sub-case/张量/元素；B570 特有排查用）
+            if (std::fabs(numeric - ana) > tol * (1.0 + std::fabs(ana))) {
+                std::printf("    [gradcheck] 张量 %s 元素 %lld: numeric=%.6g ana=%.6g "
+                            "diff=%.3g tol=%.3g (x=%.6g lp=%.6g lm=%.6g eps=%.3g)\n",
+                            x->name, (long long) i, numeric, ana, std::fabs(numeric - ana),
+                            tol * (1.0 + std::fabs(ana)), (double) v, (double) lp, (double) lm, eps);
+            }
             TRC_EXPECT_NEAR(numeric, ana, tol * (1.0 + std::fabs(ana)));
             tensor_set(x, &v, (size_t) i * sizeof(float), sizeof(float));
         }
@@ -589,7 +596,7 @@ TRC_TEST(nn_weight_trailing_one_dims) {
     Rng rng;
     rng_seed(&rng, 4242);
 
-    // ConvTranspose1d：Cin=1（尾部 1 维形态）；fan_in = K*Cout = 12
+    // ConvTranspose1d：Cin=1（RVC 生成器首层形态）；fan_in = K*Cout = 12
     ConvTranspose1d ct{};
     convtranspose1d_init(f.ctx, &ct, 1, 3, 4, 2, 1, 1, true, &rng, "ct1");
     Tensor* x_ct = new_tensor_3d(f.ctx, TYPE_F32, 5, 1, 2);

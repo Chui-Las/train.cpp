@@ -11,7 +11,7 @@
 //   - 可选：RNG 状态（Rng::state，多优化器共享一份）
 //
 // 用法（断点续训，单优化器）：
-//   checkpoint_save("ckpt.gguf", {opt, &rng, sched}, "my.model");
+//   checkpoint_save("ckpt.gguf", {opt, &rng, sched}, "rvc");
 //   // 新进程：构建同结构模型 → buffer_alloc_ctx_tensors → 创建同类型优化器/调度器 →
 //   // optim_alloc_state(opt);
 //   checkpoint_load("ckpt.gguf", {opt, &rng, sched});

@@ -1,7 +1,7 @@
 // train.cpp - GGUF 文件读写（与 ggml v0.23.0 对齐，M1.6a）
 //
 // 目的：
-//   - 训练产物导出为 GGUF，可被 ggml 生态程序直接加载推理（首要兼容目标是 ggml）；
+//   - 训练产物导出为 GGUF，可被 ggml 生态程序（如 RVC-GGML）直接加载推理（首要兼容目标是 ggml）；
 //   - 可读取 ggml 生态导出的 GGUF（含常见量化类型，反量化为 F32），用于热启动/微调。
 //
 // 格式要点（与 ggml src/gguf.cpp 逐条一致）：

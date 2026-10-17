@@ -91,6 +91,9 @@ const OpTable& op_table() {
         t[OP_CONV_TRANSPOSE_2D] = {"conv_transpose_2d", "conv_transpose_2d(x)"};
         t[OP_OPT_STEP_ADAMW]    = {"opt_step_adamw", "opt_step_adamw(x)"};
         t[OP_OPT_STEP_SGD]      = {"opt_step_sgd", "opt_step_sgd(x)"};
+        t[OP_SUM_SQR_ACC]       = {"sum_sqr_acc", "sum_sqr_acc(x)"};
+        t[OP_CLIP_SCALE_INPLACE] = {"clip_scale_inplace", "clip_scale_inplace(x)"};
+        t[OP_WEIGHTNORM_SYNC]   = {"weightnorm_sync", "weightnorm_sync(x)"};
         return t;
     }();
     return table;

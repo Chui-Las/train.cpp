@@ -239,7 +239,7 @@ TRC_TEST(grad_activations) {
     check_gradients(f, {x}, loss);
 }
 
-// LeakyReLU 反向在 ±0 的导数约定：
+// LeakyReLU 反向在 ±0 的导数约定（RVC-Q17 / FIX-001）：
 // PyTorch：x > 0 → 1；x <= 0（含 ±0）→ slope。kink 点中心差分不可用，此处用解析断言。
 TRC_TEST(grad_leaky_relu_zero_convention) {
     GradFixture f;

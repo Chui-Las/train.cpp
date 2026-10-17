@@ -107,6 +107,11 @@ enum Op : int32_t {
     OP_OPT_STEP_ADAMW,
     OP_OPT_STEP_SGD,
 
+    // ---- 设备端梯度裁剪 / WeightNorm 同步（M4.5；训练扩展，均为就地副作用算子，结果 = 输入完整视图）----
+    OP_SUM_SQR_ACC,         // acc[0] += Σ a²
+    OP_CLIP_SCALE_INPLACE,  // a *= min(1, max_norm / (sqrt(norm[0]) + eps))
+    OP_WEIGHTNORM_SYNC,     // g[oc] = sqrt(Σ_rest v²)（逐输出通道）
+
     OP_COUNT,
 };
 

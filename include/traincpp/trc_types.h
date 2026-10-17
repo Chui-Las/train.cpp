@@ -1,6 +1,6 @@
 // train.cpp - 通用 C++ 深度学习训练库
 // 数据类型定义：枚举值与 ggml v0.23.0 的 enum ggml_type 完全一致
-// （参考 ggml v0.23.0 的 include/ggml.h），保证 GGUF 读写与 ggml 生态兼容。
+// （参考 ggml-master/include/ggml.h:389-434），保证 GGUF 读写与 ggml 生态兼容。
 #pragma once
 
 #include <cstddef>

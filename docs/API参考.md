@@ -21,7 +21,7 @@
 
 | 接口 | 说明 |
 |---|---|
-| `struct Tensor` | 张量：`type`、`ne[4]`、`nb[4]`、`op`、`op_params`、`flags`、`src[10]`、`nsrc`、`view_src`、`data`、`name`、`grad`、`grad_acc` |
+| `struct Tensor` | 张量：`type`、`ne[4]`、`nb[4]`、`op`、`op_params`、`flags`、`src[10]`、`nsrc`、`view_src`、`data`、`data_offset`、`name`、`grad`、`grad_acc` |
 | `enum TensorFlags` | `TENSOR_FLAG_INPUT` / `OUTPUT` / `PARAM` / `LOSS` / `COMPUTE` |
 | `new_tensor_1d/2d/3d/4d`、`new_tensor_nd` | 创建张量 |
 | `tensor_dup_meta` | 复制元数据（形状/类型/名字） |
@@ -59,7 +59,7 @@
 |---|---|
 | `enum class DeviceType` | `CPU` / `GPU` / `IGPU` / `ACCEL` |
 | `DeviceProps` | 设备信息 |
-| `class Device` | `props` / `default_buffer_type` / `alloc_buffer` / `supports_op` / `graph_compute` |
+| `class Device` | `props` / `default_buffer_type` / `alloc_buffer` / `supports_op` / `graph_compute` / `fill_tensors`（M4.2，设备端批量填充） |
 | `class BufferType` / `class Buffer` | 缓冲类型与缓冲 |
 | `graph_first_unsupported` | 整图预检 |
 | `device_count` / `device_get` / `device_by_type` / `device_cpu` | 设备枚举 |
@@ -151,7 +151,7 @@
 | `optim_group_type` / `optim_group_param_count` / `optim_group_state_count` / `optim_get_lr_group` / `optim_group_sgd_options` / `optim_group_adamw_options` | 分组信息 |
 | `optim_step_count` / `optim_set_step_count` / `optim_state_step` / `optim_set_state_step` | 步数 |
 | `optim_get_lr` / `optim_set_lr` / `optim_set_lr_group` | 学习率 |
-| `optim_zero_grad` / `optim_step` / `optim_clip_grad_norm` | 更新 |
+| `optim_zero_grad` / `optim_step` / `optim_clip_grad_norm` | 更新（非 CPU 设备自 M4 起透明设备分派；`TRC_OPT_HOST=1` 强制主机） |
 | `lr_scheduler_step_new` / `exponential_new` / `cosine_new` / `warmup_cosine_new` / `free` | 调度器创建 / 释放 |
 | `lr_scheduler_step` / `get_lr` / `epoch` | 调度器推进 / 查询 |
 

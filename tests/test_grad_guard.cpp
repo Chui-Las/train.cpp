@@ -1,7 +1,7 @@
 // train.cpp - autograd 构建期守卫死亡测试（M2.1e / R4 + R15）
 //
 // 语义：多图共享参数、同一图重复反向展开都必须在**构建期明确中止**
-//       （否则梯度静默双倍 / 多图 grad 单指针互踩）。
+//       （否则梯度静默双倍 / 多图 grad 单指针互踩；见 docs/开发进度-二期.md §5.1 R4）。
 //   - 本程序按参数选择场景，期望在 graph_build_backward_expand 处中止（退出码非 0）
 //   - 未中止则打印错误并返回 0；CTest 经 tests/expect_abort.cmake 判定：中止=通过
 #include "traincpp/traincpp.h"

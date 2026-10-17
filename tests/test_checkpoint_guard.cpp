@@ -1,7 +1,7 @@
 // train.cpp - checkpoint 保存期守卫死亡测试（M2.3f / schema v2 多优化器）
 //
 // 语义：多优化器分区的**名字重复**、**跨分区张量名重复**都必须在保存期明确中止
-//       （否则载入分区歧义 / GGUF 张量同名互相覆盖）。
+//       （否则载入分区歧义 / GGUF 张量同名互相覆盖；见 docs/开发进度-二期.md §7.6 D 行 f）。
 //   - 本程序按参数选择场景，期望在 checkpoint_save 处中止（退出码非 0）
 //   - 未中止则打印错误并返回 0；CTest 经 tests/expect_abort.cmake 判定：中止=通过
 #include "traincpp/traincpp.h"

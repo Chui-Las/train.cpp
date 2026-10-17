@@ -4,7 +4,7 @@
 //   - 层是纯数据结构：持有参数张量指针与超参；前向用已有算子组合实现（自由函数）
 //   - 权重布局与 PyTorch state_dict 一致（张量 ne = torch 形状反序）——可直接导出 GGUF
 //   - 参数遍历用 ParamList，供优化器（optim_*）与 M1.6 checkpoint/GGUF 使用
-//   - 复合模型由使用方自定义结构体 + 自由函数组装（本库不含具体模型层）
+//   - 复合模型由使用方自定义结构体 + 自由函数组装（本库不含 RVC 专属层）
 //
 // 初始化默认值与 PyTorch 对齐：
 //   Linear/Conv：kaiming_uniform(a=√5)（等价 bound=1/√fan_in），bias 为 ±1/√fan_in 均匀分布
@@ -192,6 +192,10 @@ struct WeightNorm {
     Tensor* g = nullptr;
     Tensor* v = nullptr;
     char    name[MAX_NAME] = {0};
+    // M4.5d：设备端 weightnorm_sync_g 缓存（内部使用；懒建，勿手工设置）
+    Context* ctx       = nullptr;
+    Graph*   dev_graph = nullptr;
+    Tensor*  dev_node  = nullptr;
 };
 
 void    weightnorm_init(Context* ctx, WeightNorm* wn, Tensor* v, Tensor* g,

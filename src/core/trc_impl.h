@@ -86,6 +86,11 @@ GraphMemoryPlan graph_memory_plan(const Context* ctx, const Graph* graph);
 // 用户直接 Device::alloc_buffer 的分配不计。
 void backend_note_buffer_alloc(Buffer* buf, size_t bytes);
 
+// 批量填充（M4.2）：把若干 F32 连续张量填成指定值。若这些张量同属一个设备，
+// 走该设备的 fill_tensors（Vulkan 合并为单次提交）；否则逐张量回退（主机填充）。
+// 供 graph_reset / graph_reset_accumulate（trc_autograd.cpp）与 optim_zero_grad（trc_optim.cpp）使用。
+void tensor_fill_values(const TensorFill* fills, size_t count);
+
 // 向上对齐
 inline size_t align_up(size_t v, size_t align) {
     return (v + align - 1) & ~(align - 1);

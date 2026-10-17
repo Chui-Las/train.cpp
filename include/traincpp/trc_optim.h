@@ -1,8 +1,9 @@
-// train.cpp - 优化器与学习率调度（主机端实现，后端无关）
+// train.cpp - 优化器与学习率调度（主机实现 + 设备端透明分派）
 //
-// 设计要点（M1.5a）：
-//   - 优化器在主机侧读写参数与梯度（tensor_get/tensor_set），CPU/Vulkan 等后端同样可用；
-//     设备端融合算子（OP_OPT_STEP_SGD/ADAMW）留待后续性能阶段。
+// 设计要点（M1.5a；M4.1–M4.3 扩展）：
+//   - 默认在主机侧读写参数与梯度（tensor_get/tensor_set），CPU/Vulkan 等后端同样可用；
+//     M4.1 已实现设备算子 OP_OPT_STEP_SGD/ADAMW（原地更新），M4.3 起 optim_step 对
+//     "参数/梯度/状态同属一个非 CPU 后端设备"透明自动分派（TRC_OPT_HOST=1 强制主机）。
 //   - 超参与更新公式与 PyTorch（torch.optim.SGD / torch.optim.AdamW）逐条对齐，
 //     便于黄金数据对拍与从 PyTorch 迁移训练脚本。
 //   - 状态（SGD momentum、AdamW m/v）以 F32 张量形式暴露，供 checkpoint 序列化（M1.6）。
@@ -125,7 +126,7 @@ LrScheduler* lr_scheduler_step_new(Optimizer* opt, int64_t step_size, float gamm
 LrScheduler* lr_scheduler_exponential_new(Optimizer* opt, float gamma);
 // CosineAnnealingLR：lr = eta_min + (base-eta_min)·(1+cos(pi·t/T_max))/2（t 为已推进次数）
 LrScheduler* lr_scheduler_cosine_new(Optimizer* opt, int64_t t_max, float eta_min);
-// 线性 warmup + 余弦退火（本库扩展）：
+// 线性 warmup + 余弦退火（本库扩展，RVC 等训练常用）：
 //   t <= warmup_steps：lr = base·t/warmup_steps（t=0 时为 0）
 //   t >  warmup_steps：在剩余 total_steps-warmup_steps 步内从 base 余弦退火到 eta_min
 LrScheduler* lr_scheduler_warmup_cosine_new(Optimizer* opt, int64_t warmup_steps, int64_t total_steps,
